@@ -593,6 +593,42 @@ def compare_scorings(scores: torch.Tensor, scores_alt: torch.Tensor,
     }
 
 
+def build_frequency_mask(counts: torch.Tensor, keep_n: int, n_hash: int) -> dict:
+    """Baseline: keep the most-often-selected experts. The naive heuristic that
+    any sensible person tries first -- if the paper's score cannot beat this,
+    the extra machinery is not earning its place."""
+    return build_mask_from_scores(counts.float(), keep_n, n_hash)
+
+
+def build_random_mask(n_layers: int, n_experts: int, keep_n: int, n_hash: int, seed: int) -> dict:
+    """Floor: a seeded random subset. If this matches the scored masks, the
+    scoring carries no signal and the model is simply robust to expert removal."""
+    g = torch.Generator().manual_seed(seed)
+    mask = {"keep_per_layer": keep_n, "n_experts": n_experts,
+            "protected_hash_layers": list(range(n_hash)),
+            "score_key": "random", "seed": seed, "layers": {}}
+    for lid in range(n_layers):
+        if lid < n_hash:
+            mask["layers"][str(lid)] = {"kept": list(range(n_experts)), "pruned": []}
+            continue
+        perm = torch.randperm(n_experts, generator=g)
+        mask["layers"][str(lid)] = {"kept": sorted(perm[:keep_n].tolist()),
+                                    "pruned": sorted(perm[keep_n:].tolist())}
+    return mask
+
+
+def all_variants(scores, scores_alt, counts, keep_n, n_hash, n_layers, n_experts,
+                 seed: int, controls: bool):
+    """The variant set, in a fixed order so runs stay comparable."""
+    v = [("full", None),
+         ("pruned_paper", build_mask_from_scores(scores, keep_n, n_hash)),
+         ("pruned_no_simibr", build_mask_from_scores(scores_alt, keep_n, n_hash))]
+    if controls:
+        v.append(("pruned_frequency", build_frequency_mask(counts, keep_n, n_hash)))
+        v.append(("pruned_random", build_random_mask(n_layers, n_experts, keep_n, n_hash, seed)))
+    return v
+
+
 def cmd_pipeline(a) -> None:
     """profile -> mask -> eval(full) -> eval(pruned), on ONE model load."""
     official, model, tok, args, rank, world_size = build(
@@ -616,16 +652,21 @@ def cmd_pipeline(a) -> None:
 
     # ---------------- phase 1: calibration ----------------
     set_mask(model, None, args.n_hash_layers, dev)
-    if a.mask_in:
-        # Reusing a mask from an earlier run: profiling is deterministic, so there
-        # is nothing to gain by repeating it (and it costs ~10 min of 4xH100).
-        mask = json.loads(Path(a.mask_in).read_text())
-        variants = [("full", None), ("pruned_paper", mask)]
-        say(f"phases 1-2 skipped; reusing mask {a.mask_in} "
-            f"(keep={mask.get('keep_per_layer')}/{mask.get('n_experts')})")
-        if a.mask_in_alt:
-            variants.append(("pruned_no_simibr", json.loads(Path(a.mask_in_alt).read_text())))
-            say(f"also evaluating no-simibr mask {a.mask_in_alt}")
+    if a.scores_in:
+        # Profiling is deterministic, so reuse an earlier run's scores rather than
+        # spend ~10 min of 4xH100 recomputing them. All masks are rebuilt here, so
+        # every variant comes from one consistent set of statistics.
+        st = torch.load(a.scores_in, map_location="cpu")
+        variants = all_variants(st["score"].float(), st["score_no_simibr"].float(),
+                                st["counts"], a.keep, args.n_hash_layers,
+                                args.n_layers, args.n_routed_experts,
+                                a.seed, not a.no_controls)
+        say(f"phases 1-2 skipped; masks rebuilt from {a.scores_in}")
+        say(f"variants: {', '.join(t for t, _ in variants)}")
+        if rank == 0:
+            for tag, m in variants:
+                if m is not None:
+                    (out / f"mask_{tag}.json").write_text(json.dumps(m, indent=1))
         return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                          encode_messages, generate, variants)
     files = sample_calibration_files(Path(a.calib_dir), a.n_calib)
@@ -675,9 +716,10 @@ def cmd_pipeline(a) -> None:
     # Both scoring rules are evaluated, not just the paper's. The structural
     # overlap in score_comparison.json shows the rules DISAGREE; only running
     # both shows which one selects better experts.
-    variants = [("full", None), ("pruned_paper", mask)]
-    if not a.skip_alt_eval:
-        variants.append(("pruned_no_simibr", mask_alt))
+    variants = all_variants(scores, scores_alt, prof.counts.cpu(), a.keep,
+                            args.n_hash_layers, args.n_layers, args.n_routed_experts,
+                            a.seed, not a.no_controls)
+    say(f"variants: {', '.join(t for t, _ in variants)}")
     return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                      encode_messages, generate, variants)
 
@@ -783,12 +825,11 @@ def main() -> None:
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=192)
     sp.add_argument("--max-new-tokens", type=int, default=256)
-    sp.add_argument("--mask-in-alt", default="",
-                    help="second mask to evaluate alongside --mask-in (e.g. the no-simibr one)")
-    sp.add_argument("--skip-alt-eval", action="store_true",
-                    help="evaluate only the paper's mask, not the no-simibr variant")
-    sp.add_argument("--mask-in", default="",
-                    help="reuse a mask from an earlier run and skip profiling")
+    sp.add_argument("--scores-in", default="",
+                    help="reuse expert_scores.pt from an earlier run; skips profiling "
+                         "and rebuilds every mask from those statistics")
+    sp.add_argument("--no-controls", action="store_true",
+                    help="skip the frequency and random baselines")
     sp.add_argument("--seed", type=int, default=965,
                     help="question i is decoded with manual_seed(seed+i) in both variants")
     sp.add_argument("--temperature", type=float, default=None,

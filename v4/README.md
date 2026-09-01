@@ -143,6 +143,15 @@ Three, all decoded under identical per-question seeds:
 | `full` | none - all 256 experts |
 | `pruned_paper` | top-128 by `weight x simibr x norm` (the paper's rule) |
 | `pruned_no_simibr` | top-128 by `weight x norm` (the earlier port's rule) |
+| `pruned_frequency` | top-128 by selection count - the naive heuristic |
+| `pruned_random` | seeded random 128 - the floor |
+
+The two controls answer different questions. `pruned_frequency` asks whether the
+paper's machinery beats the obvious "keep what gets picked most". `pruned_random`
+asks whether the scoring carries any signal at all -- if it ties the scored masks,
+the model is simply robust to expert removal and no scoring rule is doing work.
+Measured mask overlap against `pruned_paper`: no_simibr 94.5%, frequency 88.6%,
+random 49.7% (chance, as it should be).
 
 `score_comparison.json` shows the two rules *disagree*; running both shows which
 one selects better experts. Use `--skip-alt-eval` to drop the third variant.
