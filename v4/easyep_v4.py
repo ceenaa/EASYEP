@@ -534,6 +534,59 @@ def build_mask_from_scores(scores: torch.Tensor, keep_n: int, n_hash: int) -> di
     return mask
 
 
+def compare_scorings(scores: torch.Tensor, scores_alt: torch.Tensor,
+                     mask: dict, mask_alt: dict,
+                     keep: int, n_hash: int, n_layers: int) -> dict:
+    """Per-layer comparison of the two scoring rules.
+
+    scores      paper's rule: sum_t weight * simibr * norm
+    scores_alt  ablation:     sum_t weight * norm      (no token contribution)
+
+    The headline is the top-`keep` expert overlap per layer: how often the
+    token-contribution term actually changes which experts survive.
+    """
+    def spearman(x: torch.Tensor, y: torch.Tensor) -> float:
+        n = x.numel()
+        rx = torch.argsort(torch.argsort(x)).float()
+        ry = torch.argsort(torch.argsort(y)).float()
+        rx = rx - rx.mean()
+        ry = ry - ry.mean()
+        d = (rx.norm() * ry.norm()).clamp_min(1e-12)
+        return round(float((rx * ry).sum() / d), 4)
+
+    rows = []
+    for lid in range(n_hash, n_layers):
+        k1 = set(mask["layers"][str(lid)]["kept"])
+        k2 = set(mask_alt["layers"][str(lid)]["kept"])
+        inter = k1 & k2
+        rows.append({
+            "layer": lid,
+            "overlap": len(inter),
+            "overlap_frac": round(len(inter) / max(keep, 1), 4),
+            "jaccard": round(len(inter) / max(len(k1 | k2), 1), 4),
+            "spearman_full_ranking": spearman(scores[lid], scores_alt[lid]),
+            "only_in_paper_score": sorted(k1 - k2),
+            "only_in_no_simibr": sorted(k2 - k1),
+            "n_never_activated": int((scores[lid] == 0).sum()),
+        })
+    ov = [r["overlap"] for r in rows]
+    worst = min(rows, key=lambda r: r["overlap"])
+    return {
+        "keep_per_layer": keep,
+        "layers_compared": [n_hash, n_layers - 1],
+        "scoring_a": "paper: sum_t weight * simibr * norm",
+        "scoring_b": "ablation: sum_t weight * norm (no simibr)",
+        "overlap_mean": round(sum(ov) / len(ov), 2),
+        "overlap_mean_frac": round(sum(ov) / len(ov) / max(keep, 1), 4),
+        "overlap_min": min(ov),
+        "overlap_max": max(ov),
+        "min_overlap_layer": worst["layer"],
+        "spearman_mean": round(
+            sum(r["spearman_full_ranking"] for r in rows) / len(rows), 4),
+        "per_layer": rows,
+    }
+
+
 def cmd_pipeline(a) -> None:
     """profile -> mask -> eval(full) -> eval(pruned), on ONE model load."""
     official, model, tok, args, rank, world_size = build(
@@ -580,19 +633,23 @@ def cmd_pipeline(a) -> None:
 
     # ---------------- phase 2: mask ----------------
     scores = prof.score.float().cpu()
+    scores_alt = prof.score_no_simibr.float().cpu()
     mask = build_mask_from_scores(scores, a.keep, args.n_hash_layers)
-    mask_alt = build_mask_from_scores(prof.score_no_simibr.float().cpu(), a.keep, args.n_hash_layers)
+    mask_alt = build_mask_from_scores(scores_alt, a.keep, args.n_hash_layers)
     if rank == 0:
-        (out / "mask_keep%d.json" % a.keep).write_text(json.dumps(mask, indent=1))
-        (out / "mask_keep%d_no_simibr.json" % a.keep).write_text(json.dumps(mask_alt, indent=1))
-        # how much does the token-contribution term actually change the choice?
-        agree = []
-        for lid in range(args.n_hash_layers, args.n_layers):
-            k1 = set(mask["layers"][str(lid)]["kept"])
-            k2 = set(mask_alt["layers"][str(lid)]["kept"])
-            agree.append(len(k1 & k2) / max(len(k1), 1))
-        say(f"phase 2: mask keeps {a.keep}/{args.n_routed_experts} per layer; "
-            f"overlap with no-simibr variant = {sum(agree)/len(agree):.1%}")
+        (out / ("mask_keep%d.json" % a.keep)).write_text(json.dumps(mask, indent=1))
+        (out / ("mask_keep%d_no_simibr.json" % a.keep)).write_text(json.dumps(mask_alt, indent=1))
+        cmp_rows = compare_scorings(scores, scores_alt, mask, mask_alt,
+                                    a.keep, args.n_hash_layers, args.n_layers)
+        (out / "score_comparison.json").write_text(json.dumps(cmp_rows, indent=1))
+        ov = [r["overlap"] for r in cmp_rows["per_layer"]]
+        say(f"phase 2: mask keeps {a.keep}/{args.n_routed_experts} per layer on "
+            f"layers {args.n_hash_layers}..{args.n_layers-1}")
+        say(f"         top-{a.keep} overlap vs no-simibr: "
+            f"mean {cmp_rows['overlap_mean']}/{a.keep} "
+            f"({cmp_rows['overlap_mean_frac']:.1%}), "
+            f"min {min(ov)} (layer {cmp_rows['min_overlap_layer']}), max {max(ov)}")
+        say(f"         per-layer detail -> score_comparison.json")
         never = int((scores[args.n_hash_layers:] == 0).sum())
         say(f"         experts never activated during calibration: {never}")
 

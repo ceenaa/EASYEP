@@ -41,9 +41,22 @@ Implemented in `easyep_v4.py`:
 The accumulation must happen per token. A previous attempt accumulated `Σweight`
 and `Σnorm` into separate marginal buffers and ranked by the latter; a product-sum
 cannot be recovered from marginals, and that variant drops `simibr` entirely.
-For comparison, `score_no_simibr` (= `Σ weight·norm`) is recorded in the same
-pass, so the effect of the token-contribution term is measurable without a second
-calibration run.
+For comparison, `score_no_simibr` (= `Σ weight·norm`) is recorded in the **same
+calibration pass**, so the effect of the token-contribution term is measurable
+without a second run and without calibration variance between the two.
+
+`score_comparison.json` reports, for every layer 3–42:
+
+| field | meaning |
+|---|---|
+| `overlap` | how many of the top-128 experts the two rules agree on |
+| `jaccard` | overlap over union |
+| `spearman_full_ranking` | rank correlation over all 256 experts |
+| `only_in_paper_score` / `only_in_no_simibr` | the experts that actually differ |
+| `n_never_activated` | experts with zero calibration traffic in that layer |
+
+plus `overlap_mean`, `overlap_min`, `overlap_max` and `min_overlap_layer` so the
+layers where the token-contribution term matters most are immediately visible.
 
 ## The four V4 divergences
 
@@ -114,6 +127,7 @@ Outputs, under `--out`:
 | `expert_scores.pt` | per-layer/expert `score`, `score_no_simibr`, `counts`, `gate_sums` |
 | `mask_keep128.json` | kept/pruned expert ids per layer |
 | `mask_keep128_no_simibr.json` | same, ranked without the token-contribution term |
+| `score_comparison.json` | **per-layer** top-128 overlap between the two scorings |
 | `answers_full.jsonl` | 50 questions, unmasked |
 | `answers_pruned.jsonl` | 50 questions, masked |
 | `summary.json` | term-overlap rubric per variant |
