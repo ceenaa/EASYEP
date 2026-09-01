@@ -228,7 +228,8 @@ def set_mask(model, mask: dict | None, n_hash_layers: int, device) -> None:
 # --------------------------------------------------------------------- model
 
 
-def build(ckpt_path: str, config_path: str, code_dir: str, max_seq_len: int, max_bs: int):
+def build(ckpt_path: str, config_path: str, code_dir: str, max_seq_len: int, max_bs: int,
+          temperature: float | None = None):
     sys.path.insert(0, code_dir)
     import model as official  # noqa: E402
 
@@ -248,6 +249,11 @@ def build(ckpt_path: str, config_path: str, code_dir: str, max_seq_len: int, max
     args = official.ModelArgs(**cfg)
     args.max_seq_len = max_seq_len
     args.max_batch_size = max_bs
+    # config.json carries no "temperature", so ModelArgs defaults to 1.0 (stochastic).
+    # Transformer.forward samples every token via the Gumbel-max trick, which consumes
+    # RNG -- see the paired-seeding note in cmd_pipeline.
+    if temperature is not None:
+        args.temperature = temperature
 
     t0 = time.time()
     with torch.device("cuda"):
@@ -590,7 +596,7 @@ def compare_scorings(scores: torch.Tensor, scores_alt: torch.Tensor,
 def cmd_pipeline(a) -> None:
     """profile -> mask -> eval(full) -> eval(pruned), on ONE model load."""
     official, model, tok, args, rank, world_size = build(
-        a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1
+        a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1, a.temperature
     )
     sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
     from encoding_dsv4 import encode_messages
@@ -610,6 +616,14 @@ def cmd_pipeline(a) -> None:
 
     # ---------------- phase 1: calibration ----------------
     set_mask(model, None, args.n_hash_layers, dev)
+    if a.mask_in:
+        # Reusing a mask from an earlier run: profiling is deterministic, so there
+        # is nothing to gain by repeating it (and it costs ~10 min of 4xH100).
+        mask = json.loads(Path(a.mask_in).read_text())
+        say(f"phases 1-2 skipped; reusing mask {a.mask_in} "
+            f"(keep={mask.get('keep_per_layer')}/{mask.get('n_experts')})")
+        return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
+                         encode_messages, generate, mask)
     files = sample_calibration_files(Path(a.calib_dir), a.n_calib)
     say(f"phase 1: profiling on {len(files)} calibration files")
     prof.enabled = True
@@ -654,6 +668,13 @@ def cmd_pipeline(a) -> None:
         say(f"         experts never activated during calibration: {never}")
 
     # ---------------- phase 3+4: evaluate ----------------
+    return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
+                     encode_messages, generate, mask)
+
+
+def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
+              encode_messages, generate, mask) -> None:
+    from encoding_dsv4 import parse_message_from_completion_text  # noqa: F401
     questions = json.loads(Path(a.questions).read_text(encoding="utf-8"))
     if isinstance(questions, dict):
         questions = questions.get("questions", [])
@@ -668,6 +689,11 @@ def cmd_pipeline(a) -> None:
         for i, q in enumerate(questions):
             ids = tok.encode(encode_messages(
                 [{"role": "user", "content": question_text(q)}], thinking_mode="chat"))
+            # Paired comparison: question i must see the SAME sampling noise under
+            # both variants, otherwise the full/pruned delta mixes the pruning effect
+            # with decoder randomness. Reseed per question, identically on every rank.
+            torch.manual_seed(a.seed + i)
+            torch.cuda.manual_seed_all(a.seed + i)
             t1 = time.time()
             with torch.inference_mode():
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
@@ -685,6 +711,14 @@ def cmd_pipeline(a) -> None:
             summary[tag] = summarize(rows)
 
     if rank == 0:
+        summary["_decoding"] = {
+            "temperature": args.temperature,
+            "paired_seeding": True,
+            "seed_base": a.seed,
+            "note": ("question i is decoded under torch.manual_seed(seed+i) in BOTH "
+                     "variants, so the full/pruned delta is not confounded by "
+                     "sampling noise"),
+        }
         (out / "summary.json").write_text(json.dumps(summary, indent=1))
         say("=" * 60)
         say(f"RESULTS  keep={a.keep}/{args.n_routed_experts} experts "
@@ -739,6 +773,13 @@ def main() -> None:
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=192)
     sp.add_argument("--max-new-tokens", type=int, default=256)
+    sp.add_argument("--mask-in", default="",
+                    help="reuse a mask from an earlier run and skip profiling")
+    sp.add_argument("--seed", type=int, default=965,
+                    help="question i is decoded with manual_seed(seed+i) in both variants")
+    sp.add_argument("--temperature", type=float, default=None,
+                    help="decoding temperature; 0 = greedy (removes sampling noise entirely). "
+                         "Default None keeps the model's configured 1.0")
 
     a = p.parse_args()
     {"profile": cmd_profile, "mask": cmd_mask, "eval": cmd_eval,

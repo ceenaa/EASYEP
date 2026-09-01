@@ -136,6 +136,15 @@ Standalone modes (`profile`, `mask`, `eval`) exist for iterating on one stage.
 
 ## Open items
 
+- **Paired decoding.** `config.json` sets no `temperature`, so `ModelArgs`
+  defaults to 1.0 and `Transformer.forward` samples every token via Gumbel-max,
+  which consumes RNG. Seeding once at load would decode `full` and `pruned` under
+  different noise and confound the comparison. Question *i* is therefore decoded
+  under `manual_seed(seed + i)` in **both** variants; `--temperature 0` gives
+  greedy decoding if an entirely noise-free A/B is wanted. The regime used is
+  recorded in `summary.json._decoding`.
+
+
 - **MTP layers are excluded, not handled.** `DSparkBlock.forward` delegates to
   `Block.forward` when `start_pos > 0` with `layer_id` 43–45; the accumulator is
   bounds-guarded against that. They have their own experts under the `mtp.*`
