@@ -142,6 +142,7 @@ Three, all decoded under identical per-question seeds:
 |---|---|
 | `full` | none - all 256 experts |
 | `pruned_paper` | top-128 by `weight x simibr x norm` (the paper's rule) |
+| `pruned_mhc` | top-128 by `weight x simibr_mhc x norm` - simibr measured in the hc residual space |
 | `pruned_no_simibr` | top-128 by `weight x norm` (the earlier port's rule) |
 | `pruned_frequency` | top-128 by selection count - the naive heuristic |
 | `pruned_random` | seeded random 128 - the floor |

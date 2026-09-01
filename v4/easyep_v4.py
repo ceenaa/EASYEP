@@ -106,6 +106,9 @@ class Profiler:
         self.tokens_seen = 0
         # --- norm-recovery validation (only populated in validate mode) ---
         self.validate = False
+        # mHC-aware simibr: measured after hc_post remixes the FFN output into the
+        # hc_mult residual copies, i.e. where the contribution actually lands.
+        self.score_mhc = torch.zeros_like(self.score)
         self.score_true = torch.zeros_like(self.score)   # from explicit unweighted forwards
         self._err = []                                   # relative error samples
         self._err_n = 0
@@ -115,6 +118,7 @@ class Profiler:
 
     def state(self) -> dict[str, Any]:
         return {
+            "score_mhc": self.score_mhc.cpu(),
             "score_true": self.score_true.cpu(),
             "norm_rel_err": self.err_tensor().cpu(),
             "score": self.score.cpu(),
@@ -230,11 +234,16 @@ def patch(official: Any, profiler: Profiler) -> None:
         y = y + self.shared_experts(x)
         return y.type_as(x).view(shape)
 
-    def moe_accumulate(self, h_flat: torch.Tensor) -> None:
+    def moe_accumulate(self, h_flat: torch.Tensor, simibr_mhc: torch.Tensor = None) -> None:
         """Form the per-token product and add it to the running score.
 
         h_flat is the pre-norm reduced residual entering the FFN sub-block --
-        the V4 analogue of EASY-EP's x_before_moe.
+        the V4 analogue of EASY-EP's x_before_moe, measured in the single-vector
+        space the FFN actually sees.
+
+        simibr_mhc is the same quantity measured after hc_post has remixed the
+        contribution into the hc_mult residual copies. Both are accumulated so the
+        two definitions can be compared without a second calibration pass.
         """
         y_r = self._ep_y_routed
         simibr = (1.0 - F.cosine_similarity(h_flat.float(), (h_flat + y_r).float(), dim=-1)).clamp_min(0.0)
@@ -244,6 +253,9 @@ def patch(official: Any, profiler: Profiler) -> None:
         for slot in range(idx.size(1)):
             e = idx[:, slot]
             profiler.score[lid].index_add_(0, e, (w[:, slot] * simibr * nrm[:, slot]).double())
+            if simibr_mhc is not None:
+                profiler.score_mhc[lid].index_add_(
+                    0, e, (w[:, slot] * simibr_mhc * nrm[:, slot]).double())
             profiler.score_no_simibr[lid].index_add_(0, e, (w[:, slot] * nrm[:, slot]).double())
             if profiler.validate:
                 profiler.score_true[lid].index_add_(
@@ -271,7 +283,19 @@ def patch(official: Any, profiler: Profiler) -> None:
         if (profiler.enabled
                 and not self.ffn.gate.hash
                 and self.layer_id < profiler.n_layers):   # excludes the MTP/DSpark stages
-            self.ffn.ep_accumulate(h.view(-1, h.size(-1)))
+            simibr_mhc = None
+            y_r = getattr(self.ffn, "_ep_y_routed", None)
+            if y_r is not None:
+                # hc_post(0, ...) is the residual carried with no FFN contribution;
+                # hc_post(y_routed, ...) adds only the routed experts. Comparing the
+                # two isolates the routed contribution in the space it lands in.
+                y_r_bsd = y_r.view(h.shape)
+                base_hc = self.hc_post(torch.zeros_like(y_r_bsd), residual, post, comb)
+                routed_hc = self.hc_post(y_r_bsd, residual, post, comb)
+                simibr_mhc = (1.0 - F.cosine_similarity(
+                    base_hc.flatten(2).float(), routed_hc.flatten(2).float(), dim=-1)
+                ).clamp_min(0.0).view(-1)
+            self.ffn.ep_accumulate(h.view(-1, h.size(-1)), simibr_mhc)
         x = self.hc_post(x, residual, post, comb)
         return x
 
@@ -700,11 +724,18 @@ def build_random_mask(n_layers: int, n_experts: int, keep_n: int, n_hash: int, s
 
 
 def all_variants(scores, scores_alt, counts, keep_n, n_hash, n_layers, n_experts,
-                 seed: int, controls: bool):
-    """The variant set, in a fixed order so runs stay comparable."""
+                 seed: int, controls: bool, scores_mhc=None):
+    """The variant set, in a fixed order so runs stay comparable.
+
+    pruned_paper and pruned_mhc differ only in where simibr is measured: the
+    single-vector space the FFN sees, versus the hc_mult residual space the
+    contribution is mixed back into.
+    """
     v = [("full", None),
-         ("pruned_paper", build_mask_from_scores(scores, keep_n, n_hash)),
-         ("pruned_no_simibr", build_mask_from_scores(scores_alt, keep_n, n_hash))]
+         ("pruned_paper", build_mask_from_scores(scores, keep_n, n_hash))]
+    if scores_mhc is not None:
+        v.append(("pruned_mhc", build_mask_from_scores(scores_mhc, keep_n, n_hash)))
+    v.append(("pruned_no_simibr", build_mask_from_scores(scores_alt, keep_n, n_hash)))
     if controls:
         v.append(("pruned_frequency", build_frequency_mask(counts, keep_n, n_hash)))
         v.append(("pruned_random", build_random_mask(n_layers, n_experts, keep_n, n_hash, seed)))
@@ -819,10 +850,12 @@ def cmd_pairs(a) -> None:
             print(f"[easyep] {m}", flush=True)
 
     st = torch.load(a.scores_in, map_location="cpu")
+    smhc = st.get("score_mhc")
     variants = all_variants(st["score"].float(), st["score_no_simibr"].float(),
                             st["counts"], a.keep, args.n_hash_layers,
                             args.n_layers, args.n_routed_experts,
-                            a.seed, not a.no_controls)
+                            a.seed, not a.no_controls,
+                            smhc.float() if smhc is not None else None)
     pairs = load_pairs(Path(a.pairs_manifest), Path(a.calib_dir), a.n_pairs)
     say(f"{len(pairs)} matched pairs -> {2*len(pairs)} items per variant")
     say(f"variants: {', '.join(t for t, _ in variants)}")
@@ -1161,11 +1194,15 @@ def cmd_pipeline(a) -> None:
         # spend ~10 min of 4xH100 recomputing them. All masks are rebuilt here, so
         # every variant comes from one consistent set of statistics.
         st = torch.load(a.scores_in, map_location="cpu")
+        smhc = st.get("score_mhc")
         variants = all_variants(st["score"].float(), st["score_no_simibr"].float(),
                                 st["counts"], a.keep, args.n_hash_layers,
                                 args.n_layers, args.n_routed_experts,
-                                a.seed, not a.no_controls)
+                                a.seed, not a.no_controls,
+                                smhc.float() if smhc is not None else None)
         say(f"phases 1-2 skipped; masks rebuilt from {a.scores_in}")
+        if smhc is None:
+            say("  NOTE: no score_mhc in this scores file; skipping the mHC variant")
         say(f"variants: {', '.join(t for t, _ in variants)}")
         if rank == 0:
             for tag, m in variants:
@@ -1216,13 +1253,19 @@ def cmd_pipeline(a) -> None:
         never = int((scores[args.n_hash_layers:] == 0).sum())
         say(f"         experts never activated during calibration: {never}")
 
+    if a.profile_only:
+        say("--profile-only: stopping after scoring; masks and scores written")
+        if world_size > 1:
+            dist.destroy_process_group()
+        return
+
     # ---------------- phase 3+4: evaluate ----------------
     # Both scoring rules are evaluated, not just the paper's. The structural
     # overlap in score_comparison.json shows the rules DISAGREE; only running
     # both shows which one selects better experts.
     variants = all_variants(scores, scores_alt, prof.counts.cpu(), a.keep,
                             args.n_hash_layers, args.n_layers, args.n_routed_experts,
-                            a.seed, not a.no_controls)
+                            a.seed, not a.no_controls, prof.score_mhc.float().cpu())
     say(f"variants: {', '.join(t for t, _ in variants)}")
     return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                      encode_messages, generate, variants)
@@ -1334,6 +1377,8 @@ def main() -> None:
                          "and rebuilds every mask from those statistics")
     sp.add_argument("--no-controls", action="store_true",
                     help="skip the frequency and random baselines")
+    sp.add_argument("--profile-only", action="store_true",
+                    help="stop after producing scores and masks (no generation)")
     sp.add_argument("--seed", type=int, default=965,
                     help="question i is decoded with manual_seed(seed+i) in both variants")
     sp.add_argument("--temperature", type=float, default=None,
