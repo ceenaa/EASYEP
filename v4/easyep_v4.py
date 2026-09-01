@@ -620,10 +620,14 @@ def cmd_pipeline(a) -> None:
         # Reusing a mask from an earlier run: profiling is deterministic, so there
         # is nothing to gain by repeating it (and it costs ~10 min of 4xH100).
         mask = json.loads(Path(a.mask_in).read_text())
+        variants = [("full", None), ("pruned_paper", mask)]
         say(f"phases 1-2 skipped; reusing mask {a.mask_in} "
             f"(keep={mask.get('keep_per_layer')}/{mask.get('n_experts')})")
+        if a.mask_in_alt:
+            variants.append(("pruned_no_simibr", json.loads(Path(a.mask_in_alt).read_text())))
+            say(f"also evaluating no-simibr mask {a.mask_in_alt}")
         return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
-                         encode_messages, generate, mask)
+                         encode_messages, generate, variants)
     files = sample_calibration_files(Path(a.calib_dir), a.n_calib)
     say(f"phase 1: profiling on {len(files)} calibration files")
     prof.enabled = True
@@ -668,13 +672,19 @@ def cmd_pipeline(a) -> None:
         say(f"         experts never activated during calibration: {never}")
 
     # ---------------- phase 3+4: evaluate ----------------
+    # Both scoring rules are evaluated, not just the paper's. The structural
+    # overlap in score_comparison.json shows the rules DISAGREE; only running
+    # both shows which one selects better experts.
+    variants = [("full", None), ("pruned_paper", mask)]
+    if not a.skip_alt_eval:
+        variants.append(("pruned_no_simibr", mask_alt))
     return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
-                     encode_messages, generate, mask)
+                     encode_messages, generate, variants)
 
 
 def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
-              encode_messages, generate, mask) -> None:
-    from encoding_dsv4 import parse_message_from_completion_text  # noqa: F401
+              encode_messages, generate, variants) -> None:
+    """variants: list of (tag, mask_or_None), all decoded under identical per-question seeds."""
     questions = json.loads(Path(a.questions).read_text(encoding="utf-8"))
     if isinstance(questions, dict):
         questions = questions.get("questions", [])
@@ -682,7 +692,7 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
         questions = questions[: a.limit]
 
     summary = {}
-    for tag, m in (("full", None), ("pruned", mask)):
+    for tag, m in variants:
         set_mask(model, m, args.n_hash_layers, dev)
         say(f"phase 3: evaluating variant={tag} on {len(questions)} questions")
         rows = []
@@ -723,9 +733,9 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
         say("=" * 60)
         say(f"RESULTS  keep={a.keep}/{args.n_routed_experts} experts "
             f"on layers {args.n_hash_layers}..{args.n_layers-1}")
-        for tag in ("full", "pruned"):
+        for tag in [t for t, _ in variants]:
             s = summary.get(tag, {})
-            say(f"  {tag:7s} accepted={s.get('accepted')} sink={s.get('sink')} "
+            say(f"  {tag:17s} accepted={s.get('accepted')} sink={s.get('sink')} "
                 f"remediation={s.get('remediation')} "
                 f"verdict_vuln={s.get('verdict_vulnerable')} "
                 f"mean_s={s.get('mean_seconds')}")
@@ -773,6 +783,10 @@ def main() -> None:
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=192)
     sp.add_argument("--max-new-tokens", type=int, default=256)
+    sp.add_argument("--mask-in-alt", default="",
+                    help="second mask to evaluate alongside --mask-in (e.g. the no-simibr one)")
+    sp.add_argument("--skip-alt-eval", action="store_true",
+                    help="evaluate only the paper's mask, not the no-simibr variant")
     sp.add_argument("--mask-in", default="",
                     help="reuse a mask from an earlier run and skip profiling")
     sp.add_argument("--seed", type=int, default=965,

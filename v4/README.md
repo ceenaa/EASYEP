@@ -134,6 +134,19 @@ Outputs, under `--out`:
 
 Standalone modes (`profile`, `mask`, `eval`) exist for iterating on one stage.
 
+## Evaluated variants
+
+Three, all decoded under identical per-question seeds:
+
+| tag | mask |
+|---|---|
+| `full` | none - all 256 experts |
+| `pruned_paper` | top-128 by `weight x simibr x norm` (the paper's rule) |
+| `pruned_no_simibr` | top-128 by `weight x norm` (the earlier port's rule) |
+
+`score_comparison.json` shows the two rules *disagree*; running both shows which
+one selects better experts. Use `--skip-alt-eval` to drop the third variant.
+
 ## Open items
 
 - **Paired decoding.** `config.json` sets no `temperature`, so `ModelArgs`
