@@ -603,7 +603,9 @@ def build_frequency_mask(counts: torch.Tensor, keep_n: int, n_hash: int) -> dict
 def build_random_mask(n_layers: int, n_experts: int, keep_n: int, n_hash: int, seed: int) -> dict:
     """Floor: a seeded random subset. If this matches the scored masks, the
     scoring carries no signal and the model is simply robust to expert removal."""
-    g = torch.Generator().manual_seed(seed)
+    # build() sets the default device to cuda, so tensor creation must name CPU
+    # explicitly or it will try to pair a CPU generator with a CUDA allocation.
+    g = torch.Generator(device="cpu").manual_seed(seed)
     mask = {"keep_per_layer": keep_n, "n_experts": n_experts,
             "protected_hash_layers": list(range(n_hash)),
             "score_key": "random", "seed": seed, "layers": {}}
@@ -611,7 +613,7 @@ def build_random_mask(n_layers: int, n_experts: int, keep_n: int, n_hash: int, s
         if lid < n_hash:
             mask["layers"][str(lid)] = {"kept": list(range(n_experts)), "pruned": []}
             continue
-        perm = torch.randperm(n_experts, generator=g)
+        perm = torch.randperm(n_experts, generator=g, device="cpu")
         mask["layers"][str(lid)] = {"kept": sorted(perm[:keep_n].tolist()),
                                     "pruned": sorted(perm[keep_n:].tolist())}
     return mask
@@ -627,6 +629,226 @@ def all_variants(scores, scores_alt, counts, keep_n, n_hash, n_layers, n_experts
         v.append(("pruned_frequency", build_frequency_mask(counts, keep_n, n_hash)))
         v.append(("pruned_random", build_random_mask(n_layers, n_experts, keep_n, n_hash, seed)))
     return v
+
+
+VERDICT_PROMPT = """Perform a security review of this source file.
+
+File: {path}
+
+<UNTRUSTED_CODE>
+{code}
+</UNTRUSTED_CODE>
+
+Answer in at most 60 words, exactly this structure:
+Verdict: VULNERABLE or SAFE
+Vulnerability: precise name, or NONE
+Reasoning: one sentence
+"""
+
+
+def load_pairs(manifest: Path, root: Path, n: int, seed: int = 42) -> list[dict]:
+    """Matched vulnerable/secure file pairs from the CodeQL manifest.
+
+    The secure file is the SAME file with the flagged expression neutralised and
+    re-scanned clean, so a model that simply calls everything vulnerable scores
+    100% on one half and 0% on the other. Recall-only metrics cannot see that;
+    this can.
+    """
+    import random
+    rows = [json.loads(l) for l in manifest.read_text().splitlines() if l.strip()]
+    rng = random.Random(seed)
+    rng.shuffle(rows)
+    base = root.parent
+    out = []
+    for r in rows:
+        # Ground truth here is "CodeQL raised alerts on this file, and the
+        # neutralised copy rescans clean" -- not a human exploitability judgement.
+        # Require actual alerts so the vulnerable label means something.
+        if int(r.get("alert_locations", 0)) < 1:
+            continue
+        vp, sp = base / r["original_file"], base / r["secure_file"]
+        if not (vp.is_file() and sp.is_file()):
+            continue
+        try:
+            vc, sc = vp.read_text(errors="ignore"), sp.read_text(errors="ignore")
+        except OSError:
+            continue
+        if not vc.strip() or not sc.strip() or vc == sc:
+            continue
+        out.append({"pair_id": len(out), "queries": r.get("queries", []),
+                    "alert_locations": int(r.get("alert_locations", 0)),
+                    "vuln_path": r["original_file"], "vuln_code": vc,
+                    "safe_path": r["secure_file"], "safe_code": sc})
+        if len(out) >= n:
+            break
+    return out
+
+
+def parse_verdict(text: str) -> str | None:
+    for line in text.splitlines():
+        t = line.strip().lower()
+        if t.startswith("verdict:"):
+            v = t.split(":", 1)[1].strip()
+            if v.startswith("vulnerable"):
+                return "VULNERABLE"
+            if v.startswith("safe"):
+                return "SAFE"
+            return None
+    return None
+
+
+def discrimination_stats(rows: list[dict]) -> dict:
+    """TPR / FPR / Youden's J. J=0 means the model is not discriminating at all,
+    however confidently it words its answers."""
+    v = [r for r in rows if r["truth"] == "VULNERABLE"]
+    s = [r for r in rows if r["truth"] == "SAFE"]
+    tpr = sum(1 for r in v if r["verdict"] == "VULNERABLE") / max(len(v), 1)
+    fpr = sum(1 for r in s if r["verdict"] == "VULNERABLE") / max(len(s), 1)
+    unparsed = sum(1 for r in rows if r["verdict"] is None)
+    return {
+        "n_vulnerable": len(v), "n_safe": len(s),
+        "tpr_recall": round(tpr, 4),
+        "fpr_false_alarm": round(fpr, 4),
+        "youden_j": round(tpr - fpr, 4),
+        "balanced_accuracy": round((tpr + (1 - fpr)) / 2, 4),
+        "always_vulnerable_would_score": {"tpr_recall": 1.0, "fpr_false_alarm": 1.0,
+                                          "youden_j": 0.0, "balanced_accuracy": 0.5},
+        "unparsed_verdicts": unparsed,
+        "mean_words": round(sum(len(r["completion"].split()) for r in rows) / max(len(rows), 1), 1),
+    }
+
+
+def cmd_pairs(a) -> None:
+    """Matched-pair discrimination eval across every variant."""
+    official, model, tok, args, rank, world_size = build(
+        a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1, a.temperature)
+    sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
+    from encoding_dsv4 import encode_messages
+    sys.path.insert(0, a.code_dir)
+    from generate import generate
+
+    dev = torch.device("cuda")
+    prof = Profiler(args.n_layers, args.n_routed_experts, dev)
+    patch(official, prof)
+    out = Path(a.out)
+    if rank == 0:
+        out.mkdir(parents=True, exist_ok=True)
+
+    def say(m):
+        if rank == 0:
+            print(f"[easyep] {m}", flush=True)
+
+    st = torch.load(a.scores_in, map_location="cpu")
+    variants = all_variants(st["score"].float(), st["score_no_simibr"].float(),
+                            st["counts"], a.keep, args.n_hash_layers,
+                            args.n_layers, args.n_routed_experts,
+                            a.seed, not a.no_controls)
+    pairs = load_pairs(Path(a.pairs_manifest), Path(a.calib_dir), a.n_pairs)
+    say(f"{len(pairs)} matched pairs -> {2*len(pairs)} items per variant")
+    say(f"variants: {', '.join(t for t, _ in variants)}")
+
+    items = []
+    for p_ in pairs:
+        items.append((p_["pair_id"], "VULNERABLE", p_["vuln_path"], p_["vuln_code"]))
+        items.append((p_["pair_id"], "SAFE", p_["safe_path"], p_["safe_code"]))
+
+    summary = {}
+    for tag, m in variants:
+        set_mask(model, m, args.n_hash_layers, dev)
+        say(f"variant={tag}: {len(items)} items")
+        rows = []
+        for i, (pid, truth, path, code) in enumerate(items):
+            ids = tok.encode(encode_messages(
+                [{"role": "user", "content": VERDICT_PROMPT.format(path=path, code=code)}],
+                thinking_mode="chat"))
+            if len(ids) > a.max_seq_len:
+                ids = ids[: a.max_seq_len]
+            torch.manual_seed(a.seed + i)
+            torch.cuda.manual_seed_all(a.seed + i)
+            t1 = time.time()
+            with torch.inference_mode():
+                gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
+            completion = tok.decode(gen[0])
+            if rank == 0:
+                rows.append({"pair_id": pid, "truth": truth, "path": path,
+                             "verdict": parse_verdict(completion),
+                             "completion": completion,
+                             "seconds": round(time.time() - t1, 2)})
+                if (i + 1) % 10 == 0:
+                    say(f"  {tag} {i+1}/{len(items)}")
+        if rank == 0:
+            with (out / f"pairs_{tag}.jsonl").open("w", encoding="utf-8") as fp:
+                for r in rows:
+                    fp.write(json.dumps(r) + "\n")
+            summary[tag] = discrimination_stats(rows)
+
+    if rank == 0:
+        (out / "pairs_summary.json").write_text(json.dumps(summary, indent=1))
+        say("=" * 72)
+        say("DISCRIMINATION  (matched vulnerable/secure pairs)")
+        say(f"{'variant':<20}{'TPR':>8}{'FPR':>8}{'J':>8}{'balacc':>9}{'words':>8}")
+        for tag, _ in variants:
+            d = summary[tag]
+            say(f"{tag:<20}{d['tpr_recall']:>8.3f}{d['fpr_false_alarm']:>8.3f}"
+                f"{d['youden_j']:>8.3f}{d['balanced_accuracy']:>9.3f}{d['mean_words']:>8.1f}")
+        say("always-VULNERABLE baseline: TPR 1.000  FPR 1.000  J 0.000  balacc 0.500")
+        say("=" * 72)
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
+def cmd_blind(a) -> None:
+    """Emit an anonymised judging file plus a sealed key.
+
+    Whoever grades these -- a person or a model -- must not see which variant
+    produced an answer, or the grading is worthless. Items are shuffled and the
+    variant tags replaced with opaque labels; the mapping goes in a separate key
+    file that is not opened until the grades are in.
+    """
+    import random, hashlib
+    src, out = Path(a.results), Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pattern = "pairs_*.jsonl" if a.pairs else "answers_*.jsonl"
+    prefix = "pairs_" if a.pairs else "answers_"
+
+    records, variants = [], []
+    for f in sorted(src.glob(pattern)):
+        tag = f.stem[len(prefix):]
+        variants.append(tag)
+        for line in f.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                r["_variant"] = tag
+                records.append(r)
+    if not records:
+        raise SystemExit(f"no {pattern} under {src}")
+
+    rng = random.Random(a.seed)
+    labels = [chr(ord("A") + i) for i in range(len(variants))]
+    rng.shuffle(labels)
+    tag2label = dict(zip(sorted(variants), labels))
+
+    items = []
+    for r in records:
+        item_key = str(r.get("id") or r.get("pair_id")) + "|" + str(r.get("truth", ""))
+        items.append({
+            "uid": hashlib.sha1((item_key + r["_variant"]).encode()).hexdigest()[:12],
+            "item": item_key,
+            "system": tag2label[r["_variant"]],
+            "completion": r["completion"],
+            **({"truth": r["truth"], "path": r.get("path")} if "truth" in r else {}),
+            **({"cwe": r.get("cwe")} if "cwe" in r else {}),
+        })
+    rng.shuffle(items)
+
+    (out / "to_judge.jsonl").write_text(
+        "\n".join(json.dumps(i) for i in items) + "\n", encoding="utf-8")
+    (out / "KEY_do_not_open_until_graded.json").write_text(
+        json.dumps({"label_to_variant": {v: k for k, v in tag2label.items()},
+                    "n_items": len(items), "seed": a.seed}, indent=1), encoding="utf-8")
+    print(f"[easyep] {len(items)} items from {len(variants)} variants -> {out/'to_judge.jsonl'}")
+    print(f"[easyep] systems anonymised as {sorted(labels)}; key withheld in "
+          f"{out/'KEY_do_not_open_until_graded.json'}")
 
 
 def cmd_pipeline(a) -> None:
@@ -836,9 +1058,28 @@ def main() -> None:
                     help="decoding temperature; 0 = greedy (removes sampling noise entirely). "
                          "Default None keeps the model's configured 1.0")
 
+    sp = sub.add_parser("pairs", help="matched vulnerable/secure discrimination eval")
+    common(sp)
+    sp.add_argument("--scores-in", required=True)
+    sp.add_argument("--pairs-manifest", required=True)
+    sp.add_argument("--calib-dir", required=True, help="root of vulnerable-js-files")
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--n-pairs", type=int, default=25)
+    sp.add_argument("--keep", type=int, default=128)
+    sp.add_argument("--max-new-tokens", type=int, default=128)
+    sp.add_argument("--seed", type=int, default=965)
+    sp.add_argument("--temperature", type=float, default=None)
+    sp.add_argument("--no-controls", action="store_true")
+
+    sp = sub.add_parser("blind", help="anonymise completions for unbiased judging")
+    sp.add_argument("--results", required=True, help="dir holding answers_*.jsonl / pairs_*.jsonl")
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--pairs", action="store_true", help="blind pairs_*.jsonl instead of answers_*.jsonl")
+    sp.add_argument("--seed", type=int, default=7)
+
     a = p.parse_args()
     {"profile": cmd_profile, "mask": cmd_mask, "eval": cmd_eval,
-     "pipeline": cmd_pipeline}[a.mode](a)
+     "pipeline": cmd_pipeline, "pairs": cmd_pairs, "blind": cmd_blind}[a.mode](a)
 
 
 if __name__ == "__main__":
