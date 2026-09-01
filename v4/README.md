@@ -157,6 +157,18 @@ random 49.7% (chance, as it should be).
 `score_comparison.json` shows the two rules *disagree*; running both shows which
 one selects better experts. Use `--skip-alt-eval` to drop the third variant.
 
+## Tests
+
+```bash
+python v4/test_easyep_v4.py      # 20 tests, seconds, no GPU
+```
+
+Covers the parts a reviewer would otherwise have to check by reading: mask
+construction and partitioning, hash-layer protection, the frequency and random
+baselines, the discrimination metric (including that a constant "VULNERABLE"
+answerer scores J=0), blinding, the checkpoint allowlist, and the inlined
+`hc_post` algebra used by the mHC variant.
+
 ## Correctness gates
 
 Run before anything else; the later jobs are Slurm-gated on the first.

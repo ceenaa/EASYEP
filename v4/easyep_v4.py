@@ -175,7 +175,12 @@ def patch(official: Any, profiler: Profiler) -> None:
         weights, indices = self.gate(x, input_ids.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)
 
-        prof = profiler.enabled and not self.gate.hash
+        # Must match block_forward's accumulate guard exactly: hash layers route by
+        # token id, and the MTP/DSpark stages sit past the end of the score tensor.
+        # Profiling them would compute norms and all-gather for a result that is
+        # never consumed, and leave the stashes unreleased.
+        prof = (profiler.enabled and not self.gate.hash
+                and self.layer_id < profiler.n_layers)
         if prof:
             norms_local = torch.zeros(
                 (self.n_local_experts, n_tok), dtype=torch.float32, device=x.device
@@ -264,8 +269,10 @@ def patch(official: Any, profiler: Profiler) -> None:
             profiler.counts[lid].index_add_(0, e, torch.ones_like(e, dtype=torch.int64))
         profiler.tokens_seen += idx.size(0)
 
-        # release
+        # release: these hold [n_tok, *] tensors per layer and would otherwise stay
+        # resident through the generation phases, eating KV-cache headroom
         self._ep_norms = self._ep_weights = self._ep_indices = self._ep_y_routed = None
+        self._ep_norms_true = None
 
     # ---- Block: keep the pre-FFN residual so simibr is computable ---------
     def block_forward(self, x, start_pos, input_ids, *attn_args):
@@ -290,8 +297,10 @@ def patch(official: Any, profiler: Profiler) -> None:
                 # hc_post(y_routed, ...) adds only the routed experts. Comparing the
                 # two isolates the routed contribution in the space it lands in.
                 y_r_bsd = y_r.view(h.shape)
-                base_hc = self.hc_post(torch.zeros_like(y_r_bsd), residual, post, comb)
-                routed_hc = self.hc_post(y_r_bsd, residual, post, comb)
+                # hc_post(x, ...) = post*x + sum(comb*residual); at x=0 only the
+                # residual-mixing term survives, so build it directly.
+                base_hc = torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+                routed_hc = post.unsqueeze(-1) * y_r_bsd.unsqueeze(-2) + base_hc
                 simibr_mhc = (1.0 - F.cosine_similarity(
                     base_hc.flatten(2).float(), routed_hc.flatten(2).float(), dim=-1)
                 ).clamp_min(0.0).view(-1)
@@ -1020,6 +1029,10 @@ def cmd_parity(a) -> None:
     P = PARITY_PROMPTS
     say(f"parity: {len(P)} fixed prompts, prefill logits only")
 
+    # Compressor carries persistent kv_state/score_state buffers, so the first
+    # forward can differ from later ones. Discard it, then measure the floor from
+    # two settled runs and compare everything against the most recent of them.
+    _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)   # warmup
     base1 = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
     base2 = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
     floor = _cmp(base1, base2)
@@ -1032,20 +1045,20 @@ def cmd_parity(a) -> None:
 
     prof.enabled = False
     patched_off = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
-    c_off = _cmp(base1, patched_off)
+    c_off = _cmp(base2, patched_off)
     say(f"  patched, profiling OFF:            max_abs {c_off['max_abs']:.3e}  "
         f"argmax disagreements {c_off['argmax_disagreements']}")
 
     prof.enabled = True
     patched_on = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
     prof.enabled = False
-    c_on = _cmp(base1, patched_on)
+    c_on = _cmp(base2, patched_on)
     say(f"  patched, profiling ON:             max_abs {c_on['max_abs']:.3e}  "
         f"argmax disagreements {c_on['argmax_disagreements']}")
 
     unpatch(official, originals)
     restored = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
-    c_res = _cmp(base1, restored)
+    c_res = _cmp(base2, restored)
     say(f"  after unpatch:                     max_abs {c_res['max_abs']:.3e}")
 
     tol = max(a.tol, floor["max_abs"] * a.floor_mult)
@@ -1053,7 +1066,8 @@ def cmd_parity(a) -> None:
               "patched_profiling_on": c_on, "after_unpatch": c_res,
               "tolerance_used": tol, "abs_tol": a.tol, "floor_multiplier": a.floor_mult}
     ok = True
-    for name, c in (("profiling OFF", c_off), ("profiling ON", c_on)):
+    for name, c in (("profiling OFF", c_off), ("profiling ON", c_on),
+                    ("after unpatch", c_res)):
         if c["max_abs"] > tol or c["argmax_disagreements"] > floor["argmax_disagreements"]:
             ok = False
             say(f"  FAIL: patched {name} differs from official beyond tolerance "
