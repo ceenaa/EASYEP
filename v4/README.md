@@ -171,9 +171,9 @@ answerer scores J=0), blinding, the checkpoint allowlist, and the inlined
 
 ## Judging
 
-Generation and grading are separate. The runs only produce completions; every one
-is stored verbatim, so any rubric can be applied afterwards, repeatedly, with no
-GPU.
+The runs generate; they do not grade. There is no built-in quality metric --
+`answers_*.jsonl` holds the question, the snippet, the reference answer and the
+completion, and nothing that scores it.
 
 ```bash
 easyep_v4.py blind --results results/easyep_keep128_v2 \
@@ -181,20 +181,17 @@ easyep_v4.py blind --results results/easyep_keep128_v2 \
                    --out judge/questions
 ```
 
-`to_judge.jsonl` carries, per item: the snippet, the completion, an opaque system
-label, and a `reference` block (expected vulnerability, CWE, reasoning). The
-variant mapping goes to `KEY_do_not_open_until_graded.json`.
+`to_judge.jsonl` is one line per (item, system): snippet, completion, an opaque
+system label, and a separate `reference` block. The variant mapping is withheld
+in `KEY_do_not_open_until_graded.json`, so a judge cannot see which system it is
+reading. Grade it with whatever judge you like, then join on `uid` and open the
+key.
 
-Two things keep an LLM judge honest here:
-
-- **Blinding.** Systems are relabelled A..F and shuffled. Whoever grades cannot
-  see which is `full` and which is `pruned_random`.
-- **An objective anchor that needs no judge at all.** The matched-pair eval scores
-  verdicts against CodeQL ground truth (TPR/FPR/Youden's J). If the judge's
-  ranking disagrees with the discrimination numbers, trust the latter.
-
-Note the obvious conflict: the same party that built the pruning should not be the
-sole grader. Blinding mitigates it; the objective pair metric is the check on it.
+The one number that is still computed, because it needs no judge: the matched-pair
+eval parses the `Verdict:` line and scores it against CodeQL ground truth
+(TPR / FPR / Youden's J). The raw completions are saved either way, so a judge can
+override that reading. Pass `--no-controls` or ignore `pairs_summary.json` if you
+would rather have nothing precomputed at all.
 
 ## Correctness gates
 

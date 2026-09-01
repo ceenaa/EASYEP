@@ -1,5 +1,8 @@
 """Tests for the GPU-free logic in easyep_v4.py.
 
+There is deliberately no test of answer quality: the runs emit completions only,
+and grading is done afterwards by an external judge.
+
 Everything here runs on a login node in seconds. It covers the parts a reviewer
 would want to check by reading -- mask construction, the control baselines, the
 discrimination metric, blinding -- so those can be verified without a 164 GiB
@@ -159,44 +162,6 @@ def t_unparsed_counted():
     assert d["n_vulnerable"] == 3 and d["n_safe"] == 2
 
 
-# --------------------------------------------------------- term rubric
-
-
-def t_score_completion_recall_only_is_gameable():
-    """Documents the weakness that motivated the paired eval: a wall of
-    security vocabulary scores well on recall alone."""
-    q = {"cwe": "CWE-79", "accepted_terms": ["cross-site scripting", "xss", "cwe-79"],
-         "sink_terms": ["res.send"], "source_terms": ["req.query.name"],
-         "remediation_terms": ["escape"]}
-    keyword_soup = ("Verdict: VULNERABLE. cross-site scripting xss cwe-79 res.send "
-                    "req.query.name escape sql injection path traversal")
-    s = E.score_completion(q, keyword_soup)
-    assert s["accepted"] == 1.0 and s["verdict_vulnerable"] is True
-    assert s["cwe_mentioned"] is True
-
-
-def t_score_completion_fields():
-    q = {"cwe": "CWE-89", "accepted_terms": ["sql injection"], "sink_terms": ["query("],
-         "source_terms": [], "remediation_terms": ["parameterized"]}
-    s = E.score_completion(q, "Verdict: SAFE\nNothing here.")
-    assert s["verdict"] == "SAFE" and s["verdict_vulnerable"] is False
-    assert s["accepted"] == 0.0
-    assert s["source"] is None, "an empty term list must yield None, not 0.0"
-
-
-def t_summarize_ignores_none():
-    rows = [{"seconds": 1.0, "score": {"accepted": 1.0, "sink": None, "source": None,
-                                       "remediation": 0.5, "verdict_vulnerable": True,
-                                       "cwe_mentioned": True}},
-            {"seconds": 3.0, "score": {"accepted": 0.0, "sink": None, "source": None,
-                                       "remediation": 0.5, "verdict_vulnerable": False,
-                                       "cwe_mentioned": False}}]
-    out = E.summarize(rows)
-    assert out["accepted"] == 0.5 and out["remediation"] == 0.5
-    assert out["sink"] is None
-    assert out["verdict_vulnerable"] == 0.5 and out["mean_seconds"] == 2.0
-
-
 # ------------------------------------------------------------ blinding
 
 
@@ -210,8 +175,7 @@ def t_blind_hides_variant_and_covers_all():
                 for i in range(4):
                     fp.write(json.dumps({"id": f"Q{i:02d}", "cwe": "CWE-79",
                                          "completion": f"{tag} answer {i}",
-                                         "seconds": 1.0,
-                                         "score": {"accepted": 0.0}}) + "\n")
+                                         "seconds": 1.0}) + "\n")
 
         qfile = Path(td) / "q.json"
         qfile.write_text(json.dumps([
@@ -243,6 +207,15 @@ def t_blind_hides_variant_and_covers_all():
 
 
 # ------------------------------------------------ checkpoint allowlist
+
+
+def t_no_heuristic_scoring_remains():
+    """The runs must emit completions, not grades."""
+    assert not hasattr(E, "score_completion"), "heuristic rubric is back"
+    assert not hasattr(E, "summarize"), "heuristic aggregate is back"
+    src = (HERE / "easyep_v4.py").read_text()
+    for token in ("accepted_terms", "sink_terms", "remediation_terms", "specificity_terms"):
+        assert token not in src, f"term-matching rubric leftover: {token}"
 
 
 def t_allowed_missing_is_narrow():

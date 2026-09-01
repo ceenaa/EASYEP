@@ -599,45 +599,6 @@ def sample_calibration_files(root: Path, n: int, seed: int = 42) -> list[tuple[s
     return [(str(f.relative_to(root)), f.read_text(encoding="utf-8", errors="ignore")) for f in picked]
 
 
-def score_completion(q: dict, completion: str) -> dict:
-    """Term-overlap rubric using the fields already present in questions_used.json."""
-    low = completion.lower()
-    def frac(key):
-        terms = [t for t in q.get(key, []) if t]
-        if not terms:
-            return None
-        hit = sum(1 for t in terms if t.lower() in low)
-        return hit / len(terms)
-    verdict = None
-    for line in completion.splitlines():
-        if line.strip().lower().startswith("verdict:"):
-            verdict = line.split(":", 1)[1].strip().upper()[:10]
-            break
-    cwe = q.get("cwe", "")
-    return {
-        "verdict": verdict,
-        "verdict_vulnerable": (verdict or "").startswith("VULNERABLE"),
-        "cwe_mentioned": bool(cwe) and cwe.replace("CWE-", "") in completion,
-        "accepted": frac("accepted_terms"),
-        "sink": frac("sink_terms"),
-        "source": frac("source_terms"),
-        "remediation": frac("remediation_terms"),
-    }
-
-
-def summarize(rows: list[dict]) -> dict:
-    keys = ["accepted", "sink", "source", "remediation"]
-    out = {"n": len(rows)}
-    for k in keys:
-        vals = [r["score"][k] for r in rows if r["score"].get(k) is not None]
-        out[k] = round(sum(vals) / len(vals), 4) if vals else None
-    out["verdict_vulnerable"] = round(
-        sum(1 for r in rows if r["score"]["verdict_vulnerable"]) / max(len(rows), 1), 4)
-    out["cwe_mentioned"] = round(
-        sum(1 for r in rows if r["score"]["cwe_mentioned"]) / max(len(rows), 1), 4)
-    out["mean_seconds"] = round(sum(r["seconds"] for r in rows) / max(len(rows), 1), 2)
-    return out
-
 
 def build_mask_from_scores(scores: torch.Tensor, keep_n: int, n_hash: int) -> dict:
     n_layers, n_experts = scores.shape
@@ -1332,16 +1293,25 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion = tok.decode(gen[0])
             if rank == 0:
-                rows.append({"id": q.get("id"), "cwe": q.get("cwe"),
-                             "completion": completion,
-                             "seconds": round(time.time() - t1, 2),
-                             "score": score_completion(q, completion)})
+                rows.append({
+                    "id": q.get("id"),
+                    "cwe": q.get("cwe"),
+                    "language": q.get("language"),
+                    "snippet": q.get("snippet"),
+                    "vulnerability": q.get("vulnerability"),
+                    "expected_reasoning": q.get("expected_reasoning"),
+                    "completion": completion,
+                    "seconds": round(time.time() - t1, 2),
+                })
                 say(f"  {tag} {i+1}/{len(questions)}  {time.time()-t1:.1f}s")
         if rank == 0:
             with (out / f"answers_{tag}.jsonl").open("w", encoding="utf-8") as fp:
                 for r in rows:
                     fp.write(json.dumps(r) + "\n")
-            summary[tag] = summarize(rows)
+            summary[tag] = {"n": len(rows),
+                            "mean_seconds": round(sum(r["seconds"] for r in rows) / max(len(rows), 1), 2),
+                            "mean_words": round(sum(len(r["completion"].split()) for r in rows)
+                                                / max(len(rows), 1), 1)}
 
     if rank == 0:
         summary["_decoding"] = {
@@ -1354,14 +1324,13 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
         }
         (out / "summary.json").write_text(json.dumps(summary, indent=1))
         say("=" * 60)
-        say(f"RESULTS  keep={a.keep}/{args.n_routed_experts} experts "
+        say(f"GENERATED  keep={a.keep}/{args.n_routed_experts} experts "
             f"on layers {args.n_hash_layers}..{args.n_layers-1}")
         for tag in [t for t, _ in variants]:
-            s = summary.get(tag, {})
-            say(f"  {tag:17s} accepted={s.get('accepted')} sink={s.get('sink')} "
-                f"remediation={s.get('remediation')} "
-                f"verdict_vuln={s.get('verdict_vulnerable')} "
-                f"mean_s={s.get('mean_seconds')}")
+            st_ = summary.get(tag, {})
+            say(f"  {tag:17s} n={st_.get('n')}  mean {st_.get('mean_seconds')}s  "
+                f"{st_.get('mean_words')} words -> answers_{tag}.jsonl")
+        say("  no scoring applied; grade with `blind` + your own judge")
         say("=" * 60)
     if world_size > 1:
         dist.destroy_process_group()
