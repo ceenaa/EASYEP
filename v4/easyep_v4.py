@@ -933,6 +933,18 @@ def cmd_blind(a) -> None:
     pattern = "pairs_*.jsonl" if a.pairs else "answers_*.jsonl"
     prefix = "pairs_" if a.pairs else "answers_"
 
+    # A judge cannot grade an answer without the question. answers_*.jsonl stores
+    # only the id, so join back to the question file to recover the snippet and
+    # the reference reasoning.
+    qmap = {}
+    if a.questions:
+        qs = json.loads(Path(a.questions).read_text(encoding="utf-8"))
+        if isinstance(qs, dict):
+            qs = qs.get("questions", [])
+        for q in qs:
+            if isinstance(q, dict) and q.get("id"):
+                qmap[str(q["id"])] = q
+
     records, variants = [], []
     for f in sorted(src.glob(pattern)):
         tag = f.stem[len(prefix):]
@@ -953,13 +965,21 @@ def cmd_blind(a) -> None:
     items = []
     for r in records:
         item_key = str(r.get("id") or r.get("pair_id")) + "|" + str(r.get("truth", ""))
+        q = qmap.get(str(r.get("id")))
         items.append({
             "uid": hashlib.sha1((item_key + r["_variant"]).encode()).hexdigest()[:12],
             "item": item_key,
             "system": tag2label[r["_variant"]],
             "completion": r["completion"],
+            # what was asked, so the answer can actually be graded
+            **({"language": q.get("language"), "snippet": q.get("snippet")} if q else {}),
+            # reference answer, withheld from a blind-quality pass but needed for
+            # a correctness pass -- keep it in a separate field the grader can drop
+            **({"reference": {"vulnerability": q.get("vulnerability"),
+                              "cwe": q.get("cwe"),
+                              "expected_reasoning": q.get("expected_reasoning")}} if q else {}),
             **({"truth": r["truth"], "path": r.get("path")} if "truth" in r else {}),
-            **({"cwe": r.get("cwe")} if "cwe" in r else {}),
+            **({"cwe": r.get("cwe")} if "cwe" in r and not q else {}),
         })
     rng.shuffle(items)
 
@@ -1416,6 +1436,9 @@ def main() -> None:
     sp.add_argument("--results", required=True, help="dir holding answers_*.jsonl / pairs_*.jsonl")
     sp.add_argument("--out", required=True)
     sp.add_argument("--pairs", action="store_true", help="blind pairs_*.jsonl instead of answers_*.jsonl")
+    sp.add_argument("--questions", default="",
+                    help="questions_used.json, joined by id so the judge sees the snippet "
+                         "and the reference answer alongside each completion")
     sp.add_argument("--seed", type=int, default=7)
 
     sp = sub.add_parser("parity", help="assert the patched model matches the official one")

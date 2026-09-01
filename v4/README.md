@@ -169,6 +169,33 @@ baselines, the discrimination metric (including that a constant "VULNERABLE"
 answerer scores J=0), blinding, the checkpoint allowlist, and the inlined
 `hc_post` algebra used by the mHC variant.
 
+## Judging
+
+Generation and grading are separate. The runs only produce completions; every one
+is stored verbatim, so any rubric can be applied afterwards, repeatedly, with no
+GPU.
+
+```bash
+easyep_v4.py blind --results results/easyep_keep128_v2 \
+                   --questions inputs/questions_used.json \
+                   --out judge/questions
+```
+
+`to_judge.jsonl` carries, per item: the snippet, the completion, an opaque system
+label, and a `reference` block (expected vulnerability, CWE, reasoning). The
+variant mapping goes to `KEY_do_not_open_until_graded.json`.
+
+Two things keep an LLM judge honest here:
+
+- **Blinding.** Systems are relabelled A..F and shuffled. Whoever grades cannot
+  see which is `full` and which is `pruned_random`.
+- **An objective anchor that needs no judge at all.** The matched-pair eval scores
+  verdicts against CodeQL ground truth (TPR/FPR/Youden's J). If the judge's
+  ranking disagrees with the discrimination numbers, trust the latter.
+
+Note the obvious conflict: the same party that built the pruning should not be the
+sole grader. Blinding mitigates it; the objective pair metric is the check on it.
+
 ## Correctness gates
 
 Run before anything else; the later jobs are Slurm-gated on the first.

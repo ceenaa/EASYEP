@@ -213,9 +213,15 @@ def t_blind_hides_variant_and_covers_all():
                                          "seconds": 1.0,
                                          "score": {"accepted": 0.0}}) + "\n")
 
+        qfile = Path(td) / "q.json"
+        qfile.write_text(json.dumps([
+            {"id": f"Q{i:02d}", "language": "JavaScript", "snippet": f"var x={i};",
+             "vulnerability": "XSS", "cwe": "CWE-79", "expected_reasoning": "because"}
+            for i in range(4)]))
+
         class A:
-            results, out_, pairs, seed = str(src), str(out), False, 7
-        a = A(); a.out = str(out)
+            results, pairs, seed = str(src), False, 7
+        a = A(); a.out = str(out); a.questions = str(qfile)
         E.cmd_blind(a)
 
         items = [json.loads(l) for l in (out / "to_judge.jsonl").read_text().splitlines()]
@@ -225,6 +231,10 @@ def t_blind_hides_variant_and_covers_all():
             assert f'"{tag}"' not in blob, f"variant name {tag} leaked into the judging file"
         assert set(i["system"] for i in items) == {"A", "B", "C"}
         assert len({i["uid"] for i in items}) == 12, "uids must be unique"
+        # the join must supply the question and a reference for every item
+        for it in items:
+            assert it.get("snippet"), "judge cannot grade without the snippet"
+            assert it["reference"]["cwe"] == "CWE-79"
         key = json.loads((out / "KEY_do_not_open_until_graded.json").read_text())
         assert set(key["label_to_variant"].values()) == set(tags)
         # each system must answer every item exactly once
