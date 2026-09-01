@@ -156,6 +156,20 @@ random 49.7% (chance, as it should be).
 `score_comparison.json` shows the two rules *disagree*; running both shows which
 one selects better experts. Use `--skip-alt-eval` to drop the third variant.
 
+## Correctness gates
+
+Run before anything else; the later jobs are Slurm-gated on the first.
+
+| gate | what it rules out |
+|---|---|
+| `parity` | the instrumentation itself changing the model. Fixed prompts through the untouched official forwards vs the patched-but-inactive ones, comparing prefill logits against a noise floor measured by running the official model twice (expert accumulation and all-reduce are not bitwise reproducible). Fails the job on a mismatch. |
+| strict checkpoint load | a partially loaded model masquerading as a pruning effect. `load_model(strict=False)` returns `(missing, unexpected)` and callers normally discard both. Now every unexpected key, and every missing key outside `ALLOWED_MISSING`, aborts the run. |
+| `validate` | the unweighted-norm recovery. `||w*out||/w == ||out||` is exact only in exact arithmetic; V4 applies the routing weight *before* `w2`, whose FP4 path runs `act_quant`, so quantisation can break proportionality. Runs each expert twice and reports norm error plus top-k ranking overlap. |
+
+`ALLOWED_MISSING` covers only `mtp.N.embed.*` and `mtp.N.head.*`, which are
+references to the trunk embedding and head (`Transformer.__init__` assigns
+`mtp[i].embed = self.embed`) and are stored once, not per stage.
+
 ## Open items
 
 - **Paired decoding.** `config.json` sets no `temperature`, so `ModelArgs`

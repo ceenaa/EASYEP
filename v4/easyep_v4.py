@@ -43,6 +43,8 @@ from argparse import ArgumentParser
 from pathlib import Path
 from typing import Any
 
+import re
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -50,6 +52,38 @@ from safetensors.torch import load_model
 from transformers import AutoTokenizer
 
 EPS = 1e-6
+
+# Keys legitimately absent from the checkpoint. DSparkBlock holds references to
+# the trunk embedding and head (Transformer.__init__ assigns mtp[i].embed =
+# self.embed), so those parameters appear twice in state_dict but are stored
+# once; inference/convert.py drops the duplicates. Anything else missing means
+# the checkpoint and the model disagree, which must not pass silently.
+ALLOWED_MISSING = (
+    r"^mtp\.\d+\.embed\.",
+    r"^mtp\.\d+\.head\.",
+)
+
+
+def load_checkpoint_checked(model, path: str, say) -> dict:
+    """load_model(strict=False) returns (missing, unexpected) and callers usually
+    throw them away. Instrumentation bugs and checkpoint drift both surface here,
+    and either would be indistinguishable from a pruning effect downstream."""
+    missing, unexpected = load_model(model, path, strict=False)
+    missing, unexpected = sorted(set(missing)), sorted(set(unexpected))
+    unexplained = [k for k in missing if not any(re.match(p, k) for p in ALLOWED_MISSING)]
+    say(f"checkpoint {Path(path).name}: {len(missing)} missing "
+        f"({len(missing) - len(unexplained)} expected), {len(unexpected)} unexpected")
+    if unexpected or unexplained:
+        for k in unexpected[:20]:
+            say(f"  UNEXPECTED  {k}")
+        for k in unexplained[:20]:
+            say(f"  MISSING     {k}")
+        raise SystemExit(
+            f"checkpoint/model mismatch: {len(unexpected)} unexpected key(s), "
+            f"{len(unexplained)} unexplained missing key(s). Refusing to run -- "
+            f"a partially loaded model would look like a pruning effect."
+        )
+    return {"missing": missing, "unexpected": unexpected}
 
 
 # ---------------------------------------------------------------- accumulator
@@ -70,9 +104,19 @@ class Profiler:
         self.counts = torch.zeros((n_layers, n_experts), dtype=torch.int64, device=device)
         self.gate_sums = torch.zeros_like(self.score)
         self.tokens_seen = 0
+        # --- norm-recovery validation (only populated in validate mode) ---
+        self.validate = False
+        self.score_true = torch.zeros_like(self.score)   # from explicit unweighted forwards
+        self._err = []                                   # relative error samples
+        self._err_n = 0
+
+    def err_tensor(self):
+        return torch.cat(self._err) if self._err else torch.zeros(0)
 
     def state(self) -> dict[str, Any]:
         return {
+            "score_true": self.score_true.cpu(),
+            "norm_rel_err": self.err_tensor().cpu(),
             "score": self.score.cpu(),
             "score_no_simibr": self.score_no_simibr.cpu(),
             "counts": self.counts.cpu(),
@@ -132,6 +176,8 @@ def patch(official: Any, profiler: Profiler) -> None:
             norms_local = torch.zeros(
                 (self.n_local_experts, n_tok), dtype=torch.float32, device=x.device
             )
+            norms_true_local = (torch.zeros_like(norms_local)
+                                if profiler.validate else None)
 
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for e in range(self.experts_start_idx, self.experts_end_idx):
@@ -142,9 +188,19 @@ def patch(official: Any, profiler: Profiler) -> None:
             contribution = self.experts[e](x[rows], w)
             y[rows] += contribution
             if prof:
-                # ||w * out|| / w == ||out||, since w2 is linear in its input
+                # ||w * out|| / w == ||out|| holds in exact arithmetic because w2 is
+                # linear, but the weight is applied BEFORE act_quant + fp4_gemm, so
+                # quantisation can break proportionality. validate mode measures it.
                 wn = contribution.float().norm(dim=-1) / w.squeeze(-1).float().clamp_min(EPS)
                 norms_local[e - self.experts_start_idx, rows] = wn
+                if profiler.validate:
+                    true_out = self.experts[e](x[rows], None)
+                    tn = true_out.float().norm(dim=-1)
+                    norms_true_local[e - self.experts_start_idx, rows] = tn
+                    if profiler._err_n < 400_000:
+                        rel = ((wn - tn).abs() / tn.clamp_min(EPS)).flatten()
+                        profiler._err.append(rel.detach())
+                        profiler._err_n += rel.numel()
 
         if world_size > 1:
             dist.all_reduce(y)
@@ -159,6 +215,14 @@ def patch(official: Any, profiler: Profiler) -> None:
                 norms_global = norms_local
             # [n_tok, n_routed] -> per activated slot
             self._ep_norms = norms_global.t().gather(1, indices)   # [n_tok, topk]
+            if profiler.validate:
+                if world_size > 1:
+                    tb = [torch.zeros_like(norms_true_local) for _ in range(world_size)]
+                    dist.all_gather(tb, norms_true_local)
+                    nt = torch.cat(tb, dim=0)
+                else:
+                    nt = norms_true_local
+                self._ep_norms_true = nt.t().gather(1, indices)
             self._ep_weights = weights.float()                     # [n_tok, topk]
             self._ep_indices = indices                             # [n_tok, topk]
             self._ep_y_routed = y.detach()                         # routed only
@@ -181,6 +245,9 @@ def patch(official: Any, profiler: Profiler) -> None:
             e = idx[:, slot]
             profiler.score[lid].index_add_(0, e, (w[:, slot] * simibr * nrm[:, slot]).double())
             profiler.score_no_simibr[lid].index_add_(0, e, (w[:, slot] * nrm[:, slot]).double())
+            if profiler.validate:
+                profiler.score_true[lid].index_add_(
+                    0, e, (w[:, slot] * simibr * self._ep_norms_true[:, slot]).double())
             profiler.gate_sums[lid].index_add_(0, e, w[:, slot].double())
             profiler.counts[lid].index_add_(0, e, torch.ones_like(e, dtype=torch.int64))
         profiler.tokens_seen += idx.size(0)
@@ -208,10 +275,19 @@ def patch(official: Any, profiler: Profiler) -> None:
         x = self.hc_post(x, residual, post, comb)
         return x
 
+    originals = {"Gate.forward": Gate.forward, "MoE.forward": MoE.forward,
+                 "Block.forward": Block.forward}
     Gate.forward = gate_forward
     MoE.forward = moe_forward
     MoE.ep_accumulate = moe_accumulate
     Block.forward = block_forward
+    return originals
+
+
+def unpatch(official: Any, originals: dict) -> None:
+    official.Gate.forward = originals["Gate.forward"]
+    official.MoE.forward = originals["MoE.forward"]
+    official.Block.forward = originals["Block.forward"]
 
 
 def set_mask(model, mask: dict | None, n_hash_layers: int, device) -> None:
@@ -259,7 +335,11 @@ def build(ckpt_path: str, config_path: str, code_dir: str, max_seq_len: int, max
     with torch.device("cuda"):
         model = official.Transformer(args)
     tok = AutoTokenizer.from_pretrained(ckpt_path)
-    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"), strict=False)
+    def _say(m):
+        if rank == 0:
+            print(f"[easyep] {m}", flush=True)
+    load_checkpoint_checked(
+        model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"), _say)
     torch.set_default_device("cuda")
     if rank == 0:
         print(f"[easyep] model ready in {time.time()-t0:.1f}s", flush=True)
@@ -851,6 +931,208 @@ def cmd_blind(a) -> None:
           f"{out/'KEY_do_not_open_until_graded.json'}")
 
 
+PARITY_PROMPTS = [
+    "What is 2+2? Answer with the number only.",
+    "Review this snippet for security issues:\n\napp.get('/x', (req,res)=>res.send(req.query.q))",
+    "Name three sorting algorithms.",
+]
+
+
+def _logits_for(model, tok, encode_messages, prompts, max_seq_len, dev):
+    """Prefill only, returning the final-position logits. No sampling, so this is
+    free of the decoder RNG entirely."""
+    outs = []
+    for text in prompts:
+        ids = tok.encode(encode_messages([{"role": "user", "content": text}],
+                                         thinking_mode="chat"))[:max_seq_len]
+        with torch.inference_mode():
+            _, logits, _ = model.forward(torch.tensor([ids], device=dev), 0)
+        outs.append(logits.detach().float().cpu())
+    return outs
+
+
+def _cmp(a_list, b_list):
+    md = mr = 0.0
+    disagree = 0
+    for a_, b_ in zip(a_list, b_list):
+        d = (a_ - b_).abs()
+        md = max(md, d.max().item())
+        denom = a_.abs().max().item() or 1.0
+        mr = max(mr, d.max().item() / denom)
+        disagree += int((a_.argmax(-1) != b_.argmax(-1)).sum().item())
+    return {"max_abs": md, "max_rel": mr, "argmax_disagreements": disagree}
+
+
+def cmd_parity(a) -> None:
+    """Assert the patched-but-inactive model is numerically the official model.
+
+    The instrumentation rewrites Gate/MoE/Block forwards. If any rewrite changes
+    the maths, every downstream number is contaminated and the change would look
+    exactly like a pruning effect. This runs fixed prompts through the untouched
+    model and the patched one and compares logits -- against a noise floor
+    measured by running the untouched model twice, since expert accumulation and
+    all-reduce are not bitwise reproducible.
+    """
+    official, model, tok, args, rank, world_size = build(
+        a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1)
+    sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
+    from encoding_dsv4 import encode_messages
+
+    dev = torch.device("cuda")
+
+    def say(m):
+        if rank == 0:
+            print(f"[easyep] {m}", flush=True)
+
+    P = PARITY_PROMPTS
+    say(f"parity: {len(P)} fixed prompts, prefill logits only")
+
+    base1 = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
+    base2 = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
+    floor = _cmp(base1, base2)
+    say(f"  noise floor (official vs official): max_abs {floor['max_abs']:.3e}  "
+        f"argmax disagreements {floor['argmax_disagreements']}")
+
+    prof = Profiler(args.n_layers, args.n_routed_experts, dev)
+    originals = patch(official, prof)
+    set_mask(model, None, args.n_hash_layers, dev)
+
+    prof.enabled = False
+    patched_off = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
+    c_off = _cmp(base1, patched_off)
+    say(f"  patched, profiling OFF:            max_abs {c_off['max_abs']:.3e}  "
+        f"argmax disagreements {c_off['argmax_disagreements']}")
+
+    prof.enabled = True
+    patched_on = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
+    prof.enabled = False
+    c_on = _cmp(base1, patched_on)
+    say(f"  patched, profiling ON:             max_abs {c_on['max_abs']:.3e}  "
+        f"argmax disagreements {c_on['argmax_disagreements']}")
+
+    unpatch(official, originals)
+    restored = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
+    c_res = _cmp(base1, restored)
+    say(f"  after unpatch:                     max_abs {c_res['max_abs']:.3e}")
+
+    tol = max(a.tol, floor["max_abs"] * a.floor_mult)
+    report = {"noise_floor": floor, "patched_profiling_off": c_off,
+              "patched_profiling_on": c_on, "after_unpatch": c_res,
+              "tolerance_used": tol, "abs_tol": a.tol, "floor_multiplier": a.floor_mult}
+    ok = True
+    for name, c in (("profiling OFF", c_off), ("profiling ON", c_on)):
+        if c["max_abs"] > tol or c["argmax_disagreements"] > floor["argmax_disagreements"]:
+            ok = False
+            say(f"  FAIL: patched {name} differs from official beyond tolerance "
+                f"({c['max_abs']:.3e} > {tol:.3e})")
+    report["pass"] = ok
+    if rank == 0:
+        out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+        (out / "parity.json").write_text(json.dumps(report, indent=1))
+    say("=" * 64)
+    say(f"PARITY {'PASS' if ok else 'FAIL'}  (tolerance {tol:.3e}, "
+        f"noise floor {floor['max_abs']:.3e})")
+    say("=" * 64)
+    if world_size > 1:
+        dist.destroy_process_group()
+    if not ok:
+        raise SystemExit("parity check failed - instrumentation changes the model")
+
+
+def cmd_validate(a) -> None:
+    """Test the unweighted-norm recovery against explicit unweighted forwards.
+
+    ||w*out||/w == ||out|| is exact only in exact arithmetic. V4 applies the
+    routing weight BEFORE w2, and w2 runs act_quant + fp4_gemm, so scaling the
+    activation changes quantisation bins. This measures how far that pushes the
+    recovered norms, and -- what actually matters -- whether it changes which
+    experts the top-k selects.
+    """
+    official, model, tok, args, rank, world_size = build(
+        a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1)
+    sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
+    from encoding_dsv4 import encode_messages
+
+    dev = torch.device("cuda")
+    prof = Profiler(args.n_layers, args.n_routed_experts, dev)
+    patch(official, prof)
+    set_mask(model, None, args.n_hash_layers, dev)
+    out = Path(a.out)
+    if rank == 0:
+        out.mkdir(parents=True, exist_ok=True)
+
+    def say(m):
+        if rank == 0:
+            print(f"[easyep] {m}", flush=True)
+
+    files = sample_calibration_files(Path(a.calib_dir), a.n_calib)
+    say(f"validating norm recovery on {len(files)} files "
+        f"(each expert is run twice: weighted and unweighted)")
+    prof.enabled = prof.validate = True
+    for i, (rel, code) in enumerate(files):
+        ids = tok.encode(encode_messages(
+            [{"role": "user", "content": security_review_text(rel, code)}],
+            thinking_mode="chat"))
+        if len(ids) > a.max_seq_len:
+            ids = ids[: a.max_seq_len]
+        if len(ids) < 32:
+            continue
+        with torch.inference_mode():
+            model.forward(torch.tensor([ids], device=dev), 0)
+        say(f"  {i+1}/{len(files)}  {len(ids)} tok")
+    prof.enabled = prof.validate = False
+
+    if rank != 0:
+        if world_size > 1:
+            dist.destroy_process_group()
+        return
+
+    err = prof.err_tensor().float()
+    rec, tru = prof.score.float().cpu(), prof.score_true.float().cpu()
+    q = torch.tensor([0.5, 0.9, 0.99, 1.0])
+    pct = torch.quantile(err, q.to(err.device)).cpu().tolist() if err.numel() else [float("nan")] * 4
+
+    n_hash, n_layers = args.n_hash_layers, args.n_layers
+    rows, ov_all, sp_all = [], [], []
+    for lid in range(n_hash, n_layers):
+        a_top = set(torch.argsort(rec[lid], descending=True)[: a.keep].tolist())
+        b_top = set(torch.argsort(tru[lid], descending=True)[: a.keep].tolist())
+        ov = len(a_top & b_top)
+        ra = torch.argsort(torch.argsort(rec[lid], descending=True)).float()
+        rb = torch.argsort(torch.argsort(tru[lid], descending=True)).float()
+        sp = torch.corrcoef(torch.stack([ra, rb]))[0, 1].item()
+        rows.append({"layer": lid, "overlap": ov, "overlap_frac": round(ov / a.keep, 4),
+                     "spearman": round(sp, 6)})
+        ov_all.append(ov); sp_all.append(sp)
+
+    report = {
+        "keep": a.keep, "n_error_samples": int(err.numel()),
+        "norm_rel_err": {"median": pct[0], "p90": pct[1], "p99": pct[2], "max": pct[3],
+                         "mean": err.mean().item() if err.numel() else None},
+        "topk_overlap": {"mean": sum(ov_all) / len(ov_all),
+                         "min": min(ov_all), "max": max(ov_all),
+                         "mean_frac": round(sum(ov_all) / len(ov_all) / a.keep, 4),
+                         "n_layers_identical": sum(1 for o in ov_all if o == a.keep)},
+        "spearman_full_ranking": {"mean": sum(sp_all) / len(sp_all), "min": min(sp_all)},
+        "per_layer": rows,
+    }
+    (out / "norm_validation.json").write_text(json.dumps(report, indent=1))
+    torch.save({"score_recovered": rec, "score_true": tru}, out / "validation_scores.pt")
+
+    say("=" * 68)
+    say("NORM RECOVERY VALIDATION   ||w*out||/w   vs   explicit ||out||")
+    say(f"  relative norm error   median {pct[0]:.3e}  p90 {pct[1]:.3e}  "
+        f"p99 {pct[2]:.3e}  max {pct[3]:.3e}   (n={err.numel()})")
+    say(f"  top-{a.keep} overlap      mean {report['topk_overlap']['mean']:.2f}/{a.keep} "
+        f"({report['topk_overlap']['mean_frac']:.2%})  min {min(ov_all)}  "
+        f"identical on {report['topk_overlap']['n_layers_identical']}/{len(ov_all)} layers")
+    say(f"  full-ranking spearman mean {report['spearman_full_ranking']['mean']:.6f}  "
+        f"min {report['spearman_full_ranking']['min']:.6f}")
+    say("=" * 68)
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
 def cmd_pipeline(a) -> None:
     """profile -> mask -> eval(full) -> eval(pruned), on ONE model load."""
     official, model, tok, args, rank, world_size = build(
@@ -1077,9 +1359,24 @@ def main() -> None:
     sp.add_argument("--pairs", action="store_true", help="blind pairs_*.jsonl instead of answers_*.jsonl")
     sp.add_argument("--seed", type=int, default=7)
 
+    sp = sub.add_parser("parity", help="assert the patched model matches the official one")
+    common(sp)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--tol", type=float, default=1e-3, help="absolute logit tolerance")
+    sp.add_argument("--floor-mult", type=float, default=4.0,
+                    help="also allow this multiple of the measured run-to-run noise floor")
+
+    sp = sub.add_parser("validate", help="check unweighted-norm recovery against explicit forwards")
+    common(sp)
+    sp.add_argument("--calib-dir", required=True)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--n-calib", type=int, default=8)
+    sp.add_argument("--keep", type=int, default=128)
+
     a = p.parse_args()
     {"profile": cmd_profile, "mask": cmd_mask, "eval": cmd_eval,
-     "pipeline": cmd_pipeline, "pairs": cmd_pairs, "blind": cmd_blind}[a.mode](a)
+     "pipeline": cmd_pipeline, "pairs": cmd_pairs, "blind": cmd_blind,
+     "validate": cmd_validate, "parity": cmd_parity}[a.mode](a)
 
 
 if __name__ == "__main__":
