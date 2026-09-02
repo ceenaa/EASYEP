@@ -261,7 +261,7 @@ The main environment overrides are:
 | `KEEP` | `128` | experts retained in each prunable layer |
 | `N_CALIB` | `25` | calibration source files; token-exact chunking may produce more profiling trajectories |
 | `N_PAIRS` | `25` | matched vulnerable/secure pairs |
-| `MAX_SEQ_LEN` | `4096` | model context limit used by each stage |
+| `MAX_SEQ_LEN` | `65536` | V4 native context used by each stage; lower it only when GPU-memory constraints require it |
 | `MAX_NEW_TOKENS` | `256` | question-evaluation response limit |
 | `PAIR_MAX_NEW_TOKENS` | `128` | matched-pair response limit |
 | `MAX_CHUNKS` | `0` | calibration chunks per file; `0` means unlimited and a positive value is a fail-fast cap |

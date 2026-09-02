@@ -74,7 +74,9 @@ fi
 KEEP=${KEEP:-128}
 N_CALIB=${N_CALIB:-25}
 N_PAIRS=${N_PAIRS:-25}
-MAX_SEQ_LEN=${MAX_SEQ_LEN:-4096}
+# The pinned V4 config declares original_seq_len=65536.  Keep chunking only as
+# a fallback for exceptional sources that exceed the native context window.
+MAX_SEQ_LEN=${MAX_SEQ_LEN:-65536}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 PAIR_MAX_NEW_TOKENS=${PAIR_MAX_NEW_TOKENS:-128}
 MAX_CHUNKS=${MAX_CHUNKS:-0}
