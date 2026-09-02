@@ -163,6 +163,7 @@ that attestation are rejected and must be re-profiled.
 | `spearman_full_ranking` | rank correlation over all 256 experts |
 | `only_in_paper_score` / `only_in_no_simibr` | the experts that actually differ |
 | `n_never_activated` | experts with zero calibration traffic in that layer |
+| `frequency_control_cutoff` | the frequency control's cutoff margins, and how many experts tie exactly on its boundary |
 | `paper_cutoff` / `no_simibr_cutoff` | rank-128, rank-129, absolute-margin, and scale-normalized relative-margin diagnostics |
 
 plus `overlap_mean`, `overlap_min`, `overlap_max` and `min_overlap_layer` so the
@@ -371,7 +372,7 @@ frequency, and random controls.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 55 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 56 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask

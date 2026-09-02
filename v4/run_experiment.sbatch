@@ -674,7 +674,9 @@ run_stage pairs pairs "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --max-new-tokens "$PAIR_MAX_NEW_TOKENS"
 
 preflight_integrity
-# cmd_blind refuses to overwrite, so a resumed run must skip an completed bundle.
+# Re-running blind draws a fresh label assignment, which would invalidate the
+# key any in-flight grading is holding, so a resumed run must skip a bundle
+# it already produced. (cmd_blind itself overwrites without complaint.)
 if [[ $RESUME == 1 ]] && stage_done blind_questions; then
   echo "---------- stage: blind_questions  SKIPPED (already completed) ----------"
 else

@@ -114,6 +114,27 @@ def fixture_calibration_provenance():
     }
 
 
+def t_cutoff_diagnostics_expose_an_arbitrary_tie_break():
+    """An integer ranking ties at the cut and topk resolves it by index."""
+    n_layers, n_experts, keep, n_hash = 3, 8, 4, 1
+    # every expert selected the same number of times: the cut is pure index order
+    tied = torch.ones((n_layers, n_experts), dtype=torch.int64)
+    report = E.score_cutoff_diagnostics(tied, keep, n_hash)
+    assert report["layers_with_arbitrary_cut"] == n_layers - n_hash
+    assert report["max_experts_tied_at_cutoff"] == n_experts
+    for row in report["per_layer"]:
+        assert row["absolute_margin"] == 0.0 and row["cut_is_arbitrary"] is True
+
+    # a strictly ordered score has a real margin and no tie
+    distinct = torch.arange(n_layers * n_experts, dtype=torch.float64).reshape(
+        n_layers, n_experts)
+    clean = E.score_cutoff_diagnostics(distinct, keep, n_hash)
+    assert clean["layers_with_arbitrary_cut"] == 0
+    assert clean["max_experts_tied_at_cutoff"] == 1
+    for row in clean["per_layer"]:
+        assert row["absolute_margin"] > 0 and row["cut_is_arbitrary"] is False
+
+
 def t_calibration_loader_refuses_to_guess_at_text():
     """A record with no text field must stop the run, not become a JSON dump."""
     with tempfile.TemporaryDirectory() as td:
@@ -164,6 +185,26 @@ def t_calibration_provenance_records_its_distribution():
         must_raise(SystemExit,
                    lambda m=missing: E._validate_calibration_provenance(m),
                    "re-profile")
+
+    # every evaluation consumer rejects a wrong-distribution artifact, not just
+    # the one where the symptom was first noticed
+    raw = json.loads(json.dumps(good)); raw["security_prompt"] = False
+    for need_paths in (False, True):
+        must_raise(SystemExit,
+                   lambda n=need_paths: E._require_evaluation_calibration(
+                       {"calibration": raw}, "fixture", need_corpus_paths=n),
+                   "different distribution")
+    samples = json.loads(json.dumps(good)); samples["source_kind"] = "sample_texts"
+    # usable for the question evaluation, not for matched-pair exclusion
+    assert E._require_evaluation_calibration(
+        {"calibration": samples}, "fixture") is samples
+    must_raise(SystemExit,
+               lambda: E._require_evaluation_calibration(
+                   {"calibration": samples}, "fixture", need_corpus_paths=True),
+               "no corpus paths")
+    must_raise(SystemExit,
+               lambda: E._require_evaluation_calibration({}, "fixture"),
+               "no calibration provenance")
 
     # the builder refuses an unknown kind rather than recording it
     must_raise(ValueError, lambda: E._calibration_provenance(

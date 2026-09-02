@@ -1500,6 +1500,37 @@ def _calibration_provenance(files: list[tuple[str, str]], inputs: list[dict],
     return record
 
 
+def _require_evaluation_calibration(state: dict, source: str, *,
+                                    need_corpus_paths: bool = False) -> dict:
+    """Reject a schema-valid artifact that cannot support an evaluation.
+
+    A score artifact can be perfectly well-formed and still be the wrong thing
+    to evaluate against, so every evaluation consumer checks this -- not just
+    the one where a specific symptom was noticed first.
+
+    security_prompt is universal: masks built from raw-text calibration encode a
+    different routing distribution than the security-review prompt these
+    evaluations use. need_corpus_paths is for consumers that additionally rely
+    on selected_sources naming real corpus files, which today is matched-pair
+    selection excluding the profiled programs.
+    """
+    calibration = state.get("calibration")
+    if not isinstance(calibration, dict):
+        raise SystemExit(f"{source} has no calibration provenance; re-profile it")
+    if calibration.get("security_prompt") is not True:
+        raise SystemExit(
+            f"{source} was profiled without the security-review prompt, so its "
+            "routing statistics come from a different distribution than this "
+            "evaluation. Re-profile with `pipeline --calib-dir`.")
+    if need_corpus_paths and calibration.get("source_kind") != "corpus_files":
+        raise SystemExit(
+            f"{source} was profiled from {calibration.get('source_kind')!r}, whose "
+            "sources have no corpus paths, so matched-pair selection could not "
+            "exclude the profiled files and would report zero overlap while "
+            "possibly reusing one. Profile with `pipeline --calib-dir`.")
+    return calibration
+
+
 def _validate_calibration_provenance(record: Any, source: str = "score artifact") -> None:
     sha = re.compile(r"^[0-9a-f]{64}$")
     if not isinstance(record, dict) or record.get("provenance_schema_version") != 1:
@@ -1656,6 +1687,12 @@ def score_cutoff_diagnostics(scores: torch.Tensor, keep_n: int, n_hash: int) -> 
             margin = retained - pruned
             scale = max(abs(retained), abs(pruned), torch.finfo(torch.float64).tiny)
             relative = margin / scale
+        # Integer-valued rankings (the frequency control) tie constantly, and
+        # topk breaks ties by index, so a zero margin means the cut is index
+        # order rather than signal. Report how many experts sit exactly on the
+        # boundary value so that is visible instead of inferred.
+        tied = (None if keep_n == n_experts
+                else int((scores[lid] == ordered[keep_n - 1]).sum().item()))
         rows.append({
             "layer": lid,
             "rank_retained": keep_n,
@@ -1664,6 +1701,8 @@ def score_cutoff_diagnostics(scores: torch.Tensor, keep_n: int, n_hash: int) -> 
             "pruned_score": pruned,
             "absolute_margin": margin,
             "relative_margin": relative,
+            "experts_tied_at_cutoff": tied,
+            "cut_is_arbitrary": None if margin is None else margin == 0.0,
         })
     finite_rows = [row for row in rows if row["relative_margin"] is not None]
     minimum = (min(finite_rows, key=lambda row: row["relative_margin"])
@@ -1674,6 +1713,11 @@ def score_cutoff_diagnostics(scores: torch.Tensor, keep_n: int, n_hash: int) -> 
         "minimum_relative_margin": (None if minimum is None
                                     else minimum["relative_margin"]),
         "minimum_margin_layer": None if minimum is None else minimum["layer"],
+        "layers_with_arbitrary_cut": sum(1 for row in rows
+                                         if row["cut_is_arbitrary"]),
+        "max_experts_tied_at_cutoff": max(
+            (row["experts_tied_at_cutoff"] for row in rows
+             if row["experts_tied_at_cutoff"] is not None), default=None),
         "per_layer": rows,
     }
 
@@ -2063,22 +2107,8 @@ def cmd_pairs(a) -> None:
         return True
 
     selection = {}
-    # The disjointness guarantee is only as good as these paths. A sample_texts
-    # artifact records synthetic sample-N names that match nothing in the corpus,
-    # so the exclusion would silently no-op and the eval could reuse a profiled
-    # program while reporting zero overlap.
-    calibration = st["calibration"]
-    if calibration.get("source_kind") != "corpus_files":
-        raise SystemExit(
-            f"{a.scores_in} was profiled from "
-            f"{calibration.get('source_kind')!r}, whose sources have no corpus "
-            "paths; matched-pair selection could not exclude the profiled files. "
-            "Profile with `pipeline --calib-dir` before running pairs.")
-    if calibration.get("security_prompt") is not True:
-        raise SystemExit(
-            f"{a.scores_in} was profiled without the security-review prompt, so "
-            "its routing statistics are from a different distribution than this "
-            "evaluation. Re-profile with `pipeline --calib-dir`.")
+    calibration = _require_evaluation_calibration(
+        st, a.scores_in, need_corpus_paths=True)
     calibration_paths = {
         str(item["path"]) for item in calibration["selected_sources"]
     }
@@ -2717,6 +2747,9 @@ def cmd_pipeline(a) -> None:
         if st.get("gate_topk") not in (None, int(args.n_activated_experts)):
             raise ValueError("score artifact gate top-k does not match model config")
         _validate_score_state_observations(st, args.n_hash_layers)
+        # Every mask below is built from these scores, so the calibration
+        # distribution has to match this evaluation.
+        _require_evaluation_calibration(st, a.scores_in)
         variants = all_variants(st["score"], st["score_no_simibr"],
                                 st["counts"], st["gate_sums"],
                                 a.keep, args.n_hash_layers,
@@ -2773,6 +2806,12 @@ def cmd_pipeline(a) -> None:
                 (out / f"mask_{tag}.json").write_text(json.dumps(variant_mask, indent=1))
         cmp_rows = compare_scorings(scores, scores_alt, mask, mask_alt,
                                     a.keep, args.n_hash_layers, args.n_layers)
+        # The frequency control ranks by an integer count, so its cutoff ties
+        # constantly and topk resolves those by index. Report its margins beside
+        # the scored ones: "the paper's score beats frequency" means little if
+        # the frequency cut was index order rather than signal.
+        cmp_rows["frequency_control_cutoff"] = score_cutoff_diagnostics(
+            prof.counts.cpu(), a.keep, args.n_hash_layers)
         (out / "score_comparison.json").write_text(json.dumps(cmp_rows, indent=1))
         ov = [r["overlap"] for r in cmp_rows["per_layer"]]
         say(f"phase 2: mask keeps {a.keep}/{args.n_routed_experts} per layer on "
