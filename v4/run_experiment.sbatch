@@ -74,9 +74,14 @@ fi
 KEEP=${KEEP:-128}
 N_CALIB=${N_CALIB:-25}
 N_PAIRS=${N_PAIRS:-25}
-# The pinned V4 config declares original_seq_len=65536.  Keep chunking only as
-# a fallback for exceptional sources that exceed the native context window.
-MAX_SEQ_LEN=${MAX_SEQ_LEN:-65536}
+# NOT the config's original_seq_len=65536.  That is the model's trained context,
+# not a context one 4xH100 node can prefill: Indexer.forward scores the whole
+# prefill unblocked and materialises [1,T,16,T/4] bf16 twice, so the transient
+# is ~16*T^2 bytes against ~35 GiB of headroom (weights are 43.5 GiB/rank).
+# T=16384 costs 4.9 GiB; T=24576 costs 11.0 GiB; T=65280 costs 77.4 GiB and OOMs.
+# Chunking keeps whole sources, so a smaller window is not a loss of coverage --
+# raising this makes each chunk the OOM case instead of avoiding chunking.
+MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 PAIR_MAX_NEW_TOKENS=${PAIR_MAX_NEW_TOKENS:-128}
 MAX_CHUNKS=${MAX_CHUNKS:-0}
@@ -127,7 +132,9 @@ require_uint() {
 require_uint KEEP "$KEEP" 6 256
 require_uint N_CALIB "$N_CALIB" 1
 require_uint N_PAIRS "$N_PAIRS" 1
-require_uint MAX_SEQ_LEN "$MAX_SEQ_LEN" 2
+# Ceiling, not taste: the unblocked ~16*T^2 prefill transient reaches 11.0 GiB
+# at 24576 against ~35 GiB of headroom, and OOMs well before 65536.
+require_uint MAX_SEQ_LEN "$MAX_SEQ_LEN" 2 24576
 require_uint MAX_NEW_TOKENS "$MAX_NEW_TOKENS" 1
 require_uint PAIR_MAX_NEW_TOKENS "$PAIR_MAX_NEW_TOKENS" 1
 require_uint MAX_CHUNKS "$MAX_CHUNKS" 0
