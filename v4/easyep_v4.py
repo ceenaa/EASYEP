@@ -46,6 +46,7 @@ import platform
 import sys
 import time
 from argparse import ArgumentParser
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -60,9 +61,29 @@ from transformers import AutoTokenizer
 EPS = 1e-6
 SCORE_SCHEMA_VERSION = 2
 SCORE_SEMANTICS = "easyep-mhc-residual-generated-response-v2"
+ACCUMULATION_MODE = "torch-deterministic-index-add-v1"
 MODEL_IDENTITY_SCHEMA_VERSION = 1
 MAX_ERROR_SAMPLES_PER_LAYER_PER_RANK = 10_000
 MHC_SCORE_CHUNK_TOKENS = 1024
+
+
+@contextmanager
+def deterministic_score_reductions():
+    """Require deterministic kernels only while mutating score accumulators.
+
+    Enabling deterministic algorithms for the entire V4 forward can change or
+    reject unrelated custom FP4/TileLang kernels.  The identified source of
+    score nondeterminism is the duplicate-index CUDA ``index_add_`` reduction,
+    so keep the strict setting scoped to those reductions and restore the
+    caller's process-global setting exactly.
+    """
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
 
 # Keys legitimately absent from the checkpoint. DSparkBlock holds references to
 # the trunk embedding and head (Transformer.__init__ assigns mtp[i].embed =
@@ -160,6 +181,8 @@ class Profiler:
             "n_layers": self.n_layers,
             "n_experts": self.n_experts,
             "gate_topk": self.gate_topk,
+            "accumulation_mode": ACCUMULATION_MODE,
+            "deterministic_score_reductions": True,
             "norm_error_samples_per_layer": list(self._err_n_by_layer),
         }
         if (n_hash_layers is None) != (model_identity is None):
@@ -364,20 +387,27 @@ def patch(official: Any, profiler: Profiler) -> None:
         if simibr_mhc.shape != post_norm.shape or simibr_mhc.numel() != idx.size(0):
             raise RuntimeError("mHC observations do not match routed token count")
         residual_nrm = nrm * post_norm[:, None]
-        for slot in range(idx.size(1)):
-            e = idx[:, slot]
-            profiler.score[lid].index_add_(
-                0, e, (w[:, slot] * simibr_mhc * residual_nrm[:, slot]).double())
-            profiler.score_reduced_legacy[lid].index_add_(
-                0, e, (w[:, slot] * simibr * nrm[:, slot]).double())
-            profiler.score_no_simibr[lid].index_add_(
-                0, e, (w[:, slot] * residual_nrm[:, slot]).double())
-            if profiler.validate:
-                profiler.score_true[lid].index_add_(
-                    0, e, (w[:, slot] * simibr_mhc * post_norm
-                           * self._ep_norms_true[:, slot]).double())
-            profiler.gate_sums[lid].index_add_(0, e, w[:, slot].double())
-            profiler.counts[lid].index_add_(0, e, torch.ones_like(e, dtype=torch.int64))
+        # Expert IDs repeat across tokens.  CUDA's default index_add_ reduction
+        # may therefore use atomic additions in an unspecified order.  PyTorch
+        # 2.10 provides a deterministic CUDA path when strict deterministic
+        # algorithms are enabled; scope it to these mutations so custom model
+        # kernels outside the profiler are unaffected.
+        with deterministic_score_reductions():
+            for slot in range(idx.size(1)):
+                e = idx[:, slot]
+                profiler.score[lid].index_add_(
+                    0, e, (w[:, slot] * simibr_mhc * residual_nrm[:, slot]).double())
+                profiler.score_reduced_legacy[lid].index_add_(
+                    0, e, (w[:, slot] * simibr * nrm[:, slot]).double())
+                profiler.score_no_simibr[lid].index_add_(
+                    0, e, (w[:, slot] * residual_nrm[:, slot]).double())
+                if profiler.validate:
+                    profiler.score_true[lid].index_add_(
+                        0, e, (w[:, slot] * simibr_mhc * post_norm
+                               * self._ep_norms_true[:, slot]).double())
+                profiler.gate_sums[lid].index_add_(0, e, w[:, slot].double())
+                profiler.counts[lid].index_add_(
+                    0, e, torch.ones_like(e, dtype=torch.int64))
         profiler.tokens_seen += idx.size(0)
 
         # release: these hold [n_tok, *] tensors per layer and would otherwise stay
@@ -785,6 +815,11 @@ def _require_score_artifact(state: dict, source: str = "score artifact",
         raise SystemExit(
             f"{source} uses incompatible score schema {version!r}/{semantics!r}; "
             "re-profile with this easyep_v4.py before building or evaluating masks")
+    if (state.get("accumulation_mode") != ACCUMULATION_MODE
+            or state.get("deterministic_score_reductions") is not True):
+        raise SystemExit(
+            f"{source} does not attest deterministic score accumulation; "
+            "re-profile with this easyep_v4.py before building or evaluating masks")
     for key in ("score", "score_mhc", "score_reduced_legacy",
                 "score_no_simibr", "counts", "gate_sums"):
         if key not in state:
@@ -1052,7 +1087,8 @@ def cmd_mask(a) -> None:
     st = _require_score_artifact(
         torch.load(a.scores, map_location="cpu"), a.scores,
         n_hash_layers=a.n_hash_layers)
-    key = "score_no_simibr" if a.no_simibr else "score"
+    key = ("gate_sums" if a.gating_score else
+           "score_no_simibr" if a.no_simibr else "score")
     scores = st[key]
     n_layers, n_experts = _validate_scores(scores, a.keep, a.n_hash_layers)
     keep_n = a.keep
@@ -1549,10 +1585,13 @@ def _validate_calibration_provenance(record: Any, source: str = "score artifact"
 
 
 
-def build_mask_from_scores(scores: torch.Tensor, keep_n: int, n_hash: int) -> dict:
+def build_mask_from_scores(scores: torch.Tensor, keep_n: int, n_hash: int,
+                           score_key: str | None = None) -> dict:
     n_layers, n_experts = _validate_scores(scores, keep_n, n_hash)
     mask = {"keep_per_layer": keep_n, "n_experts": n_experts,
             "protected_hash_layers": list(range(n_hash)), "layers": {}}
+    if score_key is not None:
+        mask["score_key"] = score_key
     for lid in range(n_layers):
         if lid < n_hash:
             mask["layers"][str(lid)] = {"kept": list(range(n_experts)), "pruned": []}
@@ -1561,6 +1600,42 @@ def build_mask_from_scores(scores: torch.Tensor, keep_n: int, n_hash: int) -> di
         mask["layers"][str(lid)] = {"kept": sorted(order[:keep_n].tolist()),
                                     "pruned": sorted(order[keep_n:].tolist())}
     return mask
+
+
+def score_cutoff_diagnostics(scores: torch.Tensor, keep_n: int, n_hash: int) -> dict:
+    """Report how securely the final retained expert clears the first pruned one."""
+    n_layers, n_experts = _validate_scores(scores, keep_n, n_hash)
+    rows = []
+    for lid in range(n_hash, n_layers):
+        ordered = torch.sort(scores[lid].double(), descending=True).values
+        retained = float(ordered[keep_n - 1].item())
+        if keep_n == n_experts:
+            pruned = margin = relative = None
+        else:
+            pruned = float(ordered[keep_n].item())
+            margin = retained - pruned
+            scale = max(abs(retained), abs(pruned), torch.finfo(torch.float64).tiny)
+            relative = margin / scale
+        rows.append({
+            "layer": lid,
+            "rank_retained": keep_n,
+            "rank_pruned": None if keep_n == n_experts else keep_n + 1,
+            "retained_score": retained,
+            "pruned_score": pruned,
+            "absolute_margin": margin,
+            "relative_margin": relative,
+        })
+    finite_rows = [row for row in rows if row["relative_margin"] is not None]
+    minimum = (min(finite_rows, key=lambda row: row["relative_margin"])
+               if finite_rows else None)
+    return {
+        "keep_per_layer": keep_n,
+        "layers_compared": [n_hash, n_layers - 1] if rows else [],
+        "minimum_relative_margin": (None if minimum is None
+                                    else minimum["relative_margin"]),
+        "minimum_margin_layer": None if minimum is None else minimum["layer"],
+        "per_layer": rows,
+    }
 
 
 def compare_scorings(scores: torch.Tensor, scores_alt: torch.Tensor,
@@ -1583,6 +1658,10 @@ def compare_scorings(scores: torch.Tensor, scores_alt: torch.Tensor,
         d = (rx.norm() * ry.norm()).clamp_min(1e-12)
         return round(float((rx * ry).sum() / d), 4)
 
+    paper_cutoffs = score_cutoff_diagnostics(scores, keep, n_hash)
+    alt_cutoffs = score_cutoff_diagnostics(scores_alt, keep, n_hash)
+    paper_cutoff_by_layer = {row["layer"]: row for row in paper_cutoffs["per_layer"]}
+    alt_cutoff_by_layer = {row["layer"]: row for row in alt_cutoffs["per_layer"]}
     rows = []
     for lid in range(n_hash, n_layers):
         k1 = set(mask["layers"][str(lid)]["kept"])
@@ -1597,6 +1676,8 @@ def compare_scorings(scores: torch.Tensor, scores_alt: torch.Tensor,
             "only_in_paper_score": sorted(k1 - k2),
             "only_in_no_simibr": sorted(k2 - k1),
             "n_never_activated": int((scores[lid] == 0).sum()),
+            "paper_cutoff": paper_cutoff_by_layer[lid],
+            "no_simibr_cutoff": alt_cutoff_by_layer[lid],
         })
     ov = [r["overlap"] for r in rows]
     worst = min(rows, key=lambda r: r["overlap"])
@@ -1612,6 +1693,12 @@ def compare_scorings(scores: torch.Tensor, scores_alt: torch.Tensor,
         "min_overlap_layer": worst["layer"],
         "spearman_mean": round(
             sum(r["spearman_full_ranking"] for r in rows) / len(rows), 4),
+        "paper_cutoff_minimum_relative_margin":
+            paper_cutoffs["minimum_relative_margin"],
+        "paper_cutoff_minimum_margin_layer": paper_cutoffs["minimum_margin_layer"],
+        "no_simibr_cutoff_minimum_relative_margin":
+            alt_cutoffs["minimum_relative_margin"],
+        "no_simibr_cutoff_minimum_margin_layer": alt_cutoffs["minimum_margin_layer"],
         "per_layer": rows,
     }
 
@@ -1620,7 +1707,12 @@ def build_frequency_mask(counts: torch.Tensor, keep_n: int, n_hash: int) -> dict
     """Baseline: keep the most-often-selected experts. The naive heuristic that
     any sensible person tries first -- if the paper's score cannot beat this,
     the extra machinery is not earning its place."""
-    return build_mask_from_scores(counts, keep_n, n_hash)
+    return build_mask_from_scores(counts, keep_n, n_hash, score_key="counts")
+
+
+def build_gating_mask(gate_sums: torch.Tensor, keep_n: int, n_hash: int) -> dict:
+    """Paper baseline: keep experts with the largest total activated gate weight."""
+    return build_mask_from_scores(gate_sums, keep_n, n_hash, score_key="gate_sums")
 
 
 def build_random_mask(n_layers: int, n_experts: int, keep_n: int, n_hash: int, seed: int) -> dict:
@@ -1645,7 +1737,8 @@ def build_random_mask(n_layers: int, n_experts: int, keep_n: int, n_hash: int, s
     return mask
 
 
-def all_variants(scores, scores_alt, counts, keep_n, n_hash, n_layers, n_experts,
+def all_variants(scores, scores_alt, counts, gate_sums,
+                 keep_n, n_hash, n_layers, n_experts,
                  seed: int, controls: bool, scores_mhc=None,
                  scores_reduced_legacy=None):
     """The variant set, in a fixed order so runs stay comparable.
@@ -1655,7 +1748,7 @@ def all_variants(scores, scores_alt, counts, keep_n, n_hash, n_layers, n_experts
     """
     expected = (n_layers, n_experts)
     for name, tensor in (("score", scores), ("score_no_simibr", scores_alt),
-                         ("counts", counts)):
+                         ("counts", counts), ("gate_sums", gate_sums)):
         if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != expected:
             raise ValueError(f"{name} shape must be {expected}, got {getattr(tensor, 'shape', None)}")
         if not bool(torch.isfinite(tensor).all().item()):
@@ -1675,12 +1768,17 @@ def all_variants(scores, scores_alt, counts, keep_n, n_hash, n_layers, n_experts
         if not bool(torch.isfinite(scores_reduced_legacy).all().item()):
             raise ValueError("score_reduced_legacy contains NaN or infinity")
     v = [("full", None),
-         ("pruned_paper", build_mask_from_scores(scores, keep_n, n_hash))]
+         ("pruned_paper", build_mask_from_scores(
+             scores, keep_n, n_hash, score_key="score"))]
     if scores_reduced_legacy is not None:
         v.append(("pruned_reduced_legacy",
-                  build_mask_from_scores(scores_reduced_legacy, keep_n, n_hash)))
-    v.append(("pruned_no_simibr", build_mask_from_scores(scores_alt, keep_n, n_hash)))
+                  build_mask_from_scores(
+                      scores_reduced_legacy, keep_n, n_hash,
+                      score_key="score_reduced_legacy")))
+    v.append(("pruned_no_simibr", build_mask_from_scores(
+        scores_alt, keep_n, n_hash, score_key="score_no_simibr")))
     if controls:
+        v.append(("pruned_gating", build_gating_mask(gate_sums, keep_n, n_hash)))
         v.append(("pruned_frequency", build_frequency_mask(counts, keep_n, n_hash)))
         v.append(("pruned_random", build_random_mask(n_layers, n_experts, keep_n, n_hash, seed)))
     return v
@@ -1906,7 +2004,8 @@ def cmd_pairs(a) -> None:
     _validate_keep(a.keep, args.n_routed_experts, args.n_activated_experts)
     _validate_score_state_observations(st, args.n_hash_layers)
     variants = all_variants(st["score"], st["score_no_simibr"],
-                            st["counts"], a.keep, args.n_hash_layers,
+                            st["counts"], st["gate_sums"],
+                            a.keep, args.n_hash_layers,
                             args.n_layers, args.n_routed_experts,
                             a.seed, not a.no_controls,
                             st.get("score_mhc"), st.get("score_reduced_legacy"))
@@ -2527,9 +2626,10 @@ def cmd_pipeline(a) -> None:
     set_mask(model, None, args.n_hash_layers, dev)
     _validate_keep(a.keep, args.n_routed_experts, args.n_activated_experts)
     if a.scores_in:
-        # Profiling is deterministic, so reuse an earlier run's scores rather than
-        # spend ~10 min of 4xH100 recomputing them. All masks are rebuilt here, so
-        # every variant comes from one consistent set of statistics.
+        # Reuse the provenance-bound score artifact rather than spend ~10 min of
+        # 4xH100 recomputing it.  The artifact attests deterministic score
+        # reductions and exact calibration-token hashes; all masks are rebuilt
+        # here from one consistent set of statistics.
         st = _require_score_artifact(
             torch.load(a.scores_in, map_location="cpu"), a.scores_in,
             n_hash_layers=args.n_hash_layers, model_identity=model_identity)
@@ -2540,7 +2640,8 @@ def cmd_pipeline(a) -> None:
             raise ValueError("score artifact gate top-k does not match model config")
         _validate_score_state_observations(st, args.n_hash_layers)
         variants = all_variants(st["score"], st["score_no_simibr"],
-                                st["counts"], a.keep, args.n_hash_layers,
+                                st["counts"], st["gate_sums"],
+                                a.keep, args.n_hash_layers,
                                 args.n_layers, args.n_routed_experts,
                                 a.seed, not a.no_controls,
                                 st.get("score_mhc"), st.get("score_reduced_legacy"))
@@ -2578,9 +2679,17 @@ def cmd_pipeline(a) -> None:
     scores_alt = prof.score_no_simibr.cpu()
     mask = build_mask_from_scores(scores, a.keep, args.n_hash_layers)
     mask_alt = build_mask_from_scores(scores_alt, a.keep, args.n_hash_layers)
+    variants = all_variants(
+        scores, scores_alt, prof.counts.cpu(), prof.gate_sums.cpu(), a.keep,
+        args.n_hash_layers, args.n_layers, args.n_routed_experts,
+        a.seed, not a.no_controls, prof.score_mhc.cpu(),
+        prof.score_reduced_legacy.cpu())
     if rank == 0:
         (out / ("mask_keep%d.json" % a.keep)).write_text(json.dumps(mask, indent=1))
         (out / ("mask_keep%d_no_simibr.json" % a.keep)).write_text(json.dumps(mask_alt, indent=1))
+        for tag, variant_mask in variants:
+            if variant_mask is not None:
+                (out / f"mask_{tag}.json").write_text(json.dumps(variant_mask, indent=1))
         cmp_rows = compare_scorings(scores, scores_alt, mask, mask_alt,
                                     a.keep, args.n_hash_layers, args.n_layers)
         (out / "score_comparison.json").write_text(json.dumps(cmp_rows, indent=1))
@@ -2591,6 +2700,11 @@ def cmd_pipeline(a) -> None:
             f"mean {cmp_rows['overlap_mean']}/{a.keep} "
             f"({cmp_rows['overlap_mean_frac']:.1%}), "
             f"min {min(ov)} (layer {cmp_rows['min_overlap_layer']}), max {max(ov)}")
+        cutoff_margin = cmp_rows["paper_cutoff_minimum_relative_margin"]
+        if cutoff_margin is not None:
+            say(f"         smallest paper-score rank-{a.keep}/rank-{a.keep + 1} "
+                f"relative margin: {cutoff_margin:.3e} "
+                f"(layer {cmp_rows['paper_cutoff_minimum_margin_layer']})")
         say(f"         per-layer detail -> score_comparison.json")
         never = int((scores[args.n_hash_layers:] == 0).sum())
         say(f"         experts never activated during calibration: {never}")
@@ -2605,10 +2719,6 @@ def cmd_pipeline(a) -> None:
     # Both scoring rules are evaluated, not just the paper's. The structural
     # overlap in score_comparison.json shows the rules DISAGREE; only running
     # both shows which one selects better experts.
-    variants = all_variants(scores, scores_alt, prof.counts.cpu(), a.keep,
-                            args.n_hash_layers, args.n_layers, args.n_routed_experts,
-                            a.seed, not a.no_controls, prof.score_mhc.cpu(),
-                            prof.score_reduced_legacy.cpu())
     say(f"variants: {', '.join(t for t, _ in variants)}")
     return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                      encode_messages, generate, variants)
@@ -2734,8 +2844,13 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--keep", type=int, default=192)
     sp.add_argument("--n-hash-layers", type=int, default=3)
-    sp.add_argument("--no-simibr", action="store_true",
-                    help="rank by weight*norm only, i.e. EASY-EP without token contribution")
+    mask_score = sp.add_mutually_exclusive_group()
+    mask_score.add_argument(
+        "--no-simibr", action="store_true",
+        help="rank by weight*norm only, i.e. EASY-EP without token contribution")
+    mask_score.add_argument(
+        "--gating-score", action="store_true",
+        help="rank by total activated gate weight, the paper's gating-score baseline")
 
     sp = sub.add_parser("eval", help="generate with or without a mask")
     common(sp)
@@ -2760,7 +2875,7 @@ def main() -> None:
                     help="reuse expert_scores.pt from an earlier run; skips profiling "
                          "and rebuilds every mask from those statistics")
     sp.add_argument("--no-controls", action="store_true",
-                    help="skip the frequency and random baselines")
+                    help="skip the gating-score, frequency, and random baselines")
     sp.add_argument("--max-chunks", type=int, default=0,
                     help="maximum token-exact chunks profiled per file; 0 is unlimited; "
                          "an exceeded positive cap fails rather than dropping source")
@@ -2783,7 +2898,8 @@ def main() -> None:
     sp.add_argument("--max-new-tokens", type=int, default=128)
     sp.add_argument("--seed", type=int, default=965)
     sp.add_argument("--temperature", type=float, default=None)
-    sp.add_argument("--no-controls", action="store_true")
+    sp.add_argument("--no-controls", action="store_true",
+                    help="skip the gating-score, frequency, and random baselines")
 
     sp = sub.add_parser("blind", help="anonymise completions for unbiased judging")
     sp.add_argument("--results", required=True, help="dir holding answers_*.jsonl / pairs_*.jsonl")

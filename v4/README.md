@@ -147,6 +147,13 @@ hashes, and the resulting file, chunk, forward, and generated-token counts.
 Later stages reject the artifact unless all schema-v2, model, implementation,
 and calibration provenance checks pass.
 
+All floating-point expert accumulators use PyTorch's strict deterministic
+CUDA `index_add` path. The setting is scoped to the duplicate-index reductions
+so it does not alter the official FP4/TileLang forward kernels, and the previous
+process-global determinism setting is restored afterward. The score artifact
+records `accumulation_mode=torch-deterministic-index-add-v1`; artifacts without
+that attestation are rejected and must be re-profiled.
+
 `score_comparison.json` reports, for every layer 3–42:
 
 | field | meaning |
@@ -156,6 +163,7 @@ and calibration provenance checks pass.
 | `spearman_full_ranking` | rank correlation over all 256 experts |
 | `only_in_paper_score` / `only_in_no_simibr` | the experts that actually differ |
 | `n_never_activated` | experts with zero calibration traffic in that layer |
+| `paper_cutoff` / `no_simibr_cutoff` | rank-128, rank-129, absolute-margin, and scale-normalized relative-margin diagnostics |
 
 plus `overlap_mean`, `overlap_min`, `overlap_max` and `min_overlap_layer` so the
 layers where the token-contribution term matters most are immediately visible.
@@ -298,7 +306,8 @@ Outputs are grouped under `$EASYEP_RESULTS_ROOT/run_RUN_ID/`:
 | `scores/expert_scores.pt` | all score tensors, counts, gate sums, and score-schema metadata |
 | `scores/mask_keep{KEEP}.json` | primary mask from profiling |
 | `scores/mask_keep{KEEP}_no_simibr.json` | no-`simibr` mask from profiling |
-| `scores/score_comparison.json` | per-layer overlap between primary and no-`simibr` rankings |
+| `scores/mask_pruned_*.json` | every evaluated scored/control mask, including gating-score, frequency, and random |
+| `scores/score_comparison.json` | per-layer overlap and cutoff margins for primary and no-`simibr` rankings |
 | `questions/answers_*.jsonl` | question completions for every variant, including the exact prompt, snippet, references, decoding seed/settings, token counts, and prompt hashes |
 | `questions/mask_*.json` | masks rebuilt from the saved score artifact |
 | `questions/summary.json` | question-evaluation summary and decoding settings |
@@ -320,13 +329,16 @@ All variants are decoded under identical per-item seeds:
 | `pruned_paper` | top-`KEEP` by the mHC-aware V4 adaptation of `weight x simibr x norm` |
 | `pruned_reduced_legacy` | top-`KEEP` by the old reduced-vector approximation, when present in the score artifact |
 | `pruned_no_simibr` | top-`KEEP` by `weight x residual_norm` |
+| `pruned_gating` | top-`KEEP` by total activated gate weight - the paper's gating-score baseline |
 | `pruned_frequency` | top-`KEEP` by selection count - the naive heuristic |
 | `pruned_random` | seeded random `KEEP` - the floor |
 
-The two controls answer different questions. `pruned_frequency` asks whether the
-paper's machinery beats the obvious "keep what gets picked most". `pruned_random`
-asks whether the scoring carries any signal at all -- if it ties the scored masks,
-the model is simply robust to expert removal and no scoring rule is doing work.
+These are the paper's three pruning controls. `pruned_gating` tests whether output
+norms and token contribution improve on router weights alone. `pruned_frequency`
+asks whether the paper's machinery beats the obvious "keep what gets picked most".
+`pruned_random` asks whether the scoring carries any signal at all -- if it ties
+the scored masks, the model is simply robust to expert removal and no scoring rule
+is doing work.
 Schema-v1 overlap numbers are not comparable to the mHC-aware primary score and
 must be regenerated from a schema-v2 run.
 
@@ -336,18 +348,20 @@ paths and their content/token identities are persisted in `pairs_used.json`.
 
 `score_comparison.json` shows where the primary and no-`simibr` rules disagree;
 running both measures whether the token-contribution term helps. The standalone
-`pipeline` and `pairs` modes accept `--no-controls` to omit only the frequency and
-random controls.
+`pipeline` and `pairs` modes accept `--no-controls` to omit the gating-score,
+frequency, and random controls.
 
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 47 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 50 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask
-construction and partitioning, hash-layer protection, the frequency and random
-baselines, schema rejection, seeded calibration sampling, token-exact chunking,
+construction and partitioning, hash-layer protection, the gating-score,
+frequency, and random baselines, schema rejection, deterministic score-reduction
+state restoration, cutoff-margin reporting, seeded calibration sampling,
+token-exact chunking,
 prompt-plus-response profiling, the discrimination metric (including that a
 constant "VULNERABLE" answerer scores J=0), label-neutral paired inputs,
 calibration/matched-pair disjointness, path-traversal rejection, portable

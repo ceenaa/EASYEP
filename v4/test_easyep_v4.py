@@ -296,6 +296,13 @@ def t_frequency_is_top_count():
     assert m["layers"]["20"]["kept"] == want
 
 
+def t_gating_is_top_total_gate_weight():
+    gate_sums = torch.rand(N_L, N_E, dtype=torch.float64)
+    m = E.build_gating_mask(gate_sums, KEEP, N_HASH)
+    want = sorted(gate_sums[20].argsort(descending=True)[:KEEP].tolist())
+    assert m["layers"]["20"]["kept"] == want
+
+
 def t_random_reproducible_and_chance():
     r1 = E.build_random_mask(N_L, N_E, KEEP, N_HASH, 965)
     r2 = E.build_random_mask(N_L, N_E, KEEP, N_HASH, 965)
@@ -310,7 +317,7 @@ def t_random_reproducible_and_chance():
 
 
 def t_all_variants_use_their_own_score_source():
-    n_l, n_e, keep, n_hash = 5, 16, 4, 1
+    n_l, n_e, keep, n_hash = 5, 20, 4, 1
 
     def scores_for(experts, *, integer=False):
         dtype = torch.int64 if integer else torch.float32
@@ -321,33 +328,37 @@ def t_all_variants_use_their_own_score_source():
 
     paper_ids, legacy_ids = [0, 1, 2, 3], [4, 5, 6, 7]
     alt_ids, frequency_ids = [8, 9, 10, 11], [12, 13, 14, 15]
+    gating_ids = [16, 17, 18, 19]
     sc = scores_for(paper_ids)
     alt = scores_for(alt_ids)
     legacy = scores_for(legacy_ids)
     counts = scores_for(frequency_ids, integer=True)
+    gate_sums = scores_for(gating_ids)
 
     v = E.all_variants(
-        sc, alt, counts, keep, n_hash, n_l, n_e, 965, True,
+        sc, alt, counts, gate_sums, keep, n_hash, n_l, n_e, 965, True,
         scores_mhc=sc.clone(), scores_reduced_legacy=legacy,
     )
     tags = [t for t, _ in v]
     assert tags == ["full", "pruned_paper", "pruned_reduced_legacy", "pruned_no_simibr",
-                    "pruned_frequency", "pruned_random"], tags
+                    "pruned_gating", "pruned_frequency", "pruned_random"], tags
     assert v[0][1] is None, "full variant must carry no mask"
     by_tag = dict(v)
     assert by_tag["pruned_paper"]["layers"]["2"]["kept"] == paper_ids
     assert by_tag["pruned_reduced_legacy"]["layers"]["2"]["kept"] == legacy_ids
     assert by_tag["pruned_no_simibr"]["layers"]["2"]["kept"] == alt_ids
+    assert by_tag["pruned_gating"]["layers"]["2"]["kept"] == gating_ids
     assert by_tag["pruned_frequency"]["layers"]["2"]["kept"] == frequency_ids
     for tag, mask in v[1:]:
         assert len(mask["layers"]) == n_l, f"{tag} has the wrong layer count"
         assert len(mask["layers"]["2"]["kept"]) == keep, f"{tag} has the wrong keep count"
     # Without the legacy reduced-space diagnostic, that ablation is skipped.
-    v2 = E.all_variants(sc, alt, counts, keep, n_hash, n_l, n_e, 965, True)
+    v2 = E.all_variants(
+        sc, alt, counts, gate_sums, keep, n_hash, n_l, n_e, 965, True)
     assert "pruned_reduced_legacy" not in [t for t, _ in v2]
     # controls off
     v3 = E.all_variants(
-        sc, alt, counts, keep, n_hash, n_l, n_e, 965, False,
+        sc, alt, counts, gate_sums, keep, n_hash, n_l, n_e, 965, False,
         scores_mhc=sc, scores_reduced_legacy=legacy,
     )
     assert [t for t, _ in v3] == [
@@ -358,19 +369,29 @@ def t_all_variants_use_their_own_score_source():
 def t_all_variants_reject_mismatched_tensor_shapes():
     scores = torch.rand(4, 8)
     counts = torch.ones(4, 8, dtype=torch.int64)
+    gate_sums = torch.rand(4, 8)
     must_raise(
         ValueError,
-        lambda: E.all_variants(scores, scores[:3], counts, 4, 1, 4, 8, 7, True),
+        lambda: E.all_variants(
+            scores, scores[:3], counts, gate_sums, 4, 1, 4, 8, 7, True),
         "shape",
     )
     must_raise(
         ValueError,
-        lambda: E.all_variants(scores, scores, counts[:, :7], 4, 1, 4, 8, 7, True),
+        lambda: E.all_variants(
+            scores, scores, counts[:, :7], gate_sums, 4, 1, 4, 8, 7, True),
         "shape",
     )
     must_raise(
         ValueError,
-        lambda: E.all_variants(scores, scores, counts, 4, 1, 5, 8, 7, True),
+        lambda: E.all_variants(
+            scores, scores, counts, gate_sums, 4, 1, 5, 8, 7, True),
+        "shape",
+    )
+    must_raise(
+        ValueError,
+        lambda: E.all_variants(
+            scores, scores, counts, gate_sums[:, :7], 4, 1, 4, 8, 7, True),
         "shape",
     )
     different_primary = scores.clone()
@@ -378,7 +399,7 @@ def t_all_variants_reject_mismatched_tensor_shapes():
     must_raise(
         ValueError,
         lambda: E.all_variants(
-            scores, scores, counts, 4, 1, 4, 8, 7, True,
+            scores, scores, counts, gate_sums, 4, 1, 4, 8, 7, True,
             scores_mhc=different_primary,
         ),
         "alias",
@@ -395,6 +416,24 @@ def t_mask_input_validation():
     bad = sc.clone(); bad[2, 3] = float("nan")
     must_raise(ValueError, lambda: E.build_mask_from_scores(bad, 4, 1), "nan")
     must_raise(ValueError, lambda: E.build_random_mask(4, 8, 0, 1, 7))
+
+
+def t_cutoff_diagnostics_report_absolute_and_relative_margin():
+    scores = torch.tensor([
+        [10.0, 8.0, 6.0, 1.0],
+        [4.0, 3.0, 2.7, 0.0],
+    ])
+    report = E.score_cutoff_diagnostics(scores, 2, 0)
+    first, second = report["per_layer"]
+    assert first["rank_retained"] == 2 and first["rank_pruned"] == 3
+    assert abs(first["absolute_margin"] - 2.0) < 1e-12
+    assert abs(first["relative_margin"] - 0.25) < 1e-12
+    assert abs(second["absolute_margin"] - 0.3) < 1e-6
+    assert report["minimum_margin_layer"] == 1
+
+    no_pruning = E.score_cutoff_diagnostics(scores, 4, 0)
+    assert no_pruning["minimum_relative_margin"] is None
+    assert all(row["pruned_score"] is None for row in no_pruning["per_layer"])
 
 
 def t_keep_must_cover_gate_topk():
@@ -1137,9 +1176,29 @@ def t_profiler_shapes_and_dtypes():
     st = p.state()
     for k in ("score", "score_mhc", "score_reduced_legacy", "score_no_simibr",
               "score_true", "counts", "gate_sums", "norm_rel_err", "tokens_seen",
-              "n_layers", "n_experts", "norm_error_samples_per_layer"):
+              "n_layers", "n_experts", "accumulation_mode",
+              "deterministic_score_reductions", "norm_error_samples_per_layer"):
         assert k in st, f"state() is missing {k}"
+    assert st["accumulation_mode"] == E.ACCUMULATION_MODE
+    assert st["deterministic_score_reductions"] is True
     assert st["norm_error_samples_per_layer"] == [0] * N_L
+
+
+def t_deterministic_score_reduction_scope_restores_global_setting():
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(False)
+        target = torch.zeros(2, dtype=torch.float64)
+        with E.deterministic_score_reductions():
+            assert torch.are_deterministic_algorithms_enabled()
+            assert not torch.is_deterministic_algorithms_warn_only_enabled()
+            target.index_add_(0, torch.tensor([0, 0, 1]),
+                              torch.tensor([0.25, 0.5, 1.0], dtype=torch.float64))
+        assert not torch.are_deterministic_algorithms_enabled()
+        assert torch.equal(target, torch.tensor([0.75, 1.0], dtype=torch.float64))
+    finally:
+        torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
 
 
 def t_score_artifact_schema_rejects_stale_or_incomplete_scores():
@@ -1158,6 +1217,12 @@ def t_score_artifact_schema_rejects_stale_or_incomplete_scores():
     must_raise(SystemExit, lambda: E._require_score_artifact(wrong, "fixture"), "re-profile")
     missing = dict(state); del missing["counts"]
     must_raise(SystemExit, lambda: E._require_score_artifact(missing, "fixture"), "missing")
+    nondeterministic = dict(state); del nondeterministic["accumulation_mode"]
+    must_raise(
+        SystemExit,
+        lambda: E._require_score_artifact(nondeterministic, "fixture"),
+        "deterministic",
+    )
     must_raise(
         SystemExit,
         lambda: E._require_score_artifact(state, "fixture", n_hash_layers=2),
