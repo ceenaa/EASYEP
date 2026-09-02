@@ -282,6 +282,25 @@ def t_profiler_shapes_and_dtypes():
         assert k in st, f"state() is missing {k}"
 
 
+def t_chunking_covers_the_whole_file():
+    """Truncation drops late sinks; chunking must not."""
+    body = "".join(f"line {i} some code here\n" for i in range(400))
+    ch = E.chunk_code(body, 500, 99)
+    assert len(ch) > 1, "long file was not chunked"
+    assert "".join(ch) == body, "chunking lost or reordered content"
+    assert all(len(c) <= 500 for c in ch), "a chunk exceeded the budget"
+    assert all(c.endswith("\n") for c in ch[:-1]), "chunks must be line-aligned"
+    # short files pass through untouched
+    assert E.chunk_code("short\n", 500, 99) == ["short\n"]
+    # max_chunks caps a pathological file
+    assert len(E.chunk_code(body, 100, 3)) == 3
+    # a single line longer than the budget is hard-split, not dropped
+    one = "x" * 1200 + "\n"
+    hard = E.chunk_code(one, 500, 99)
+    assert "".join(hard) == one, "oversized line lost content"
+    assert all(len(c) <= 500 for c in hard)
+
+
 def t_calibration_sampling_is_stratified_and_stable():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

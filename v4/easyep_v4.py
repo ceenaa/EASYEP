@@ -290,27 +290,31 @@ def patch(official: Any, profiler: Profiler) -> None:
         x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         h = x                                   # <-- EASY-EP's x_before_moe
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        x_ffn = self.ffn(x, input_ids)
+        x = self.hc_post(x_ffn, residual, post, comb)
         if (profiler.enabled
                 and not self.ffn.gate.hash
                 and self.layer_id < profiler.n_layers):   # excludes the MTP/DSpark stages
             simibr_mhc = None
             y_r = getattr(self.ffn, "_ep_y_routed", None)
             if y_r is not None and profiler.do_mhc:
-                # hc_post(0, ...) is the residual carried with no FFN contribution;
-                # hc_post(y_routed, ...) adds only the routed experts. Comparing the
-                # two isolates the routed contribution in the space it lands in.
-                y_r_bsd = y_r.view(h.shape)
-                # hc_post(x, ...) = post*x + sum(comb*residual); at x=0 only the
-                # residual-mixing term survives, so build it directly.
-                base_hc = torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-                routed_hc = post.unsqueeze(-1) * y_r_bsd.unsqueeze(-2) + base_hc
+                # hc_post(v, ...) = post*v + sum(comb*residual). Rebuilding the
+                # residual-mixing term directly allocates a [b,s,hc,hc,d] tensor
+                # mid-forward, which shifts memory pressure enough that cuBLAS and
+                # TileLang select different kernels for later GEMMs -- measured as a
+                # 0.57-2.02 logit drift with profiling on. Recover it algebraically
+                # from the hc_post the model has already computed instead:
+                #     base = hc_post(x_ffn) - post*x_ffn
+                # and read it AFTER that call, so nothing upstream can be perturbed.
+                pu = post.unsqueeze(-1)
+                base_hc = x - pu * x_ffn.unsqueeze(-2)
+                routed_hc = base_hc + pu * y_r.view(h.shape).unsqueeze(-2)
                 simibr_mhc = (1.0 - F.cosine_similarity(
                     base_hc.flatten(2).float(), routed_hc.flatten(2).float(), dim=-1)
                 ).clamp_min(0.0).view(-1)
+                del base_hc, routed_hc
             if profiler.do_accum and getattr(self.ffn, "_ep_norms", None) is not None:
                 self.ffn.ep_accumulate(h.view(-1, h.size(-1)), simibr_mhc)
-        x = self.hc_post(x, residual, post, comb)
         return x
 
     originals = {"Gate.forward": Gate.forward, "MoE.forward": MoE.forward,
@@ -580,6 +584,32 @@ Reasoning: source, dangerous operation, and why it is unsafe
 Impact: realistic consequence
 Remediation: concrete fix
 """
+
+
+def chunk_code(code: str, max_chars: int, max_chunks: int) -> list[str]:
+    """Split a source file into line-aligned chunks that each fit the context.
+
+    Truncating to the first N tokens silently drops everything after it -- and a
+    sink often sits far below its source, so the routing behaviour that matters
+    is exactly what gets cut. Measured on this corpus: 17% of files exceed a
+    4096-token prompt, and one 9,962-token file alone accounted for 19% of the
+    calibration tokens in a 25-file sample.
+    """
+    if len(code) <= max_chars:
+        return [code]
+    chunks, cur, size = [], [], 0
+    for line in code.splitlines(keepends=True):
+        # a single pathological line longer than the budget: hard-split it
+        while len(line) > max_chars:
+            if cur:
+                chunks.append("".join(cur)); cur, size = [], 0
+            chunks.append(line[:max_chars]); line = line[max_chars:]
+        if size + len(line) > max_chars and cur:
+            chunks.append("".join(cur)); cur, size = [], 0
+        cur.append(line); size += len(line)
+    if cur:
+        chunks.append("".join(cur))
+    return chunks[:max_chunks]
 
 
 def sample_calibration_files(root: Path, n: int, seed: int = 42) -> list[tuple[str, str]]:
@@ -1175,8 +1205,21 @@ def cmd_validate(a) -> None:
     say(f"  full-ranking spearman mean {report['spearman_full_ranking']['mean']:.6f}  "
         f"min {report['spearman_full_ranking']['min']:.6f}")
     say("=" * 68)
+
+    frac = report["topk_overlap"]["mean_frac"]
+    ok = frac >= a.fail_under
+    report["pass"] = ok
+    report["fail_under"] = a.fail_under
+    (out / "norm_validation.json").write_text(json.dumps(report, indent=1))
+    say(f"NORM VALIDATION {'PASS' if ok else 'FAIL'}  "
+        f"(top-{a.keep} overlap {frac:.4f}, required >= {a.fail_under})")
     if world_size > 1:
         dist.destroy_process_group()
+    if not ok:
+        raise SystemExit(
+            f"norm recovery changes the top-{a.keep} selection "
+            f"({frac:.4f} < {a.fail_under}); masks built from ||w*out||/w would not "
+            f"match masks built from explicit unweighted forwards")
 
 
 def cmd_pipeline(a) -> None:
@@ -1227,18 +1270,26 @@ def cmd_pipeline(a) -> None:
     say(f"phase 1: profiling on {len(files)} calibration files")
     prof.enabled = True
     t0 = time.time()
+    # leave room for the prompt scaffolding; ~3 chars/token for this corpus
+    budget = max(512, (a.max_seq_len - 256) * 3)
+    n_chunks_total = 0
     for i, (rel, code) in enumerate(files):
-        ids = tok.encode(encode_messages(
-            [{"role": "user", "content": security_review_text(rel, code)}],
-            thinking_mode="chat"))
-        if len(ids) > a.max_seq_len:
-            ids = ids[: a.max_seq_len]
-        if len(ids) < 32:
-            continue
-        with torch.inference_mode():
-            model.forward(torch.tensor([ids], device=dev), 0)
-        say(f"  calib {i+1}/{len(files)}  {len(ids)} tok  {rel}")
+        pieces = chunk_code(code, budget, a.max_chunks)
+        for j, piece in enumerate(pieces):
+            ids = tok.encode(encode_messages(
+                [{"role": "user", "content": security_review_text(rel, piece)}],
+                thinking_mode="chat"))
+            if len(ids) > a.max_seq_len:      # safety net if the ratio was optimistic
+                ids = ids[: a.max_seq_len]
+            if len(ids) < 32:
+                continue
+            with torch.inference_mode():
+                model.forward(torch.tensor([ids], device=dev), 0)
+            n_chunks_total += 1
+            tag_ = f" chunk {j+1}/{len(pieces)}" if len(pieces) > 1 else ""
+            say(f"  calib {i+1}/{len(files)}{tag_}  {len(ids)} tok  {rel}")
     prof.enabled = False
+    say(f"  {n_chunks_total} forward passes over {len(files)} files")
     say(f"phase 1 done in {time.time()-t0:.0f}s, {prof.tokens_seen} token-layer records")
 
     if rank == 0:
@@ -1398,6 +1449,9 @@ def main() -> None:
                          "and rebuilds every mask from those statistics")
     sp.add_argument("--no-controls", action="store_true",
                     help="skip the frequency and random baselines")
+    sp.add_argument("--max-chunks", type=int, default=4,
+                    help="max context-sized chunks profiled per file; long files are "
+                         "chunked rather than truncated, so late sinks are not lost")
     sp.add_argument("--profile-only", action="store_true",
                     help="stop after producing scores and masks (no generation)")
     sp.add_argument("--seed", type=int, default=965,
@@ -1441,6 +1495,9 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-calib", type=int, default=8)
     sp.add_argument("--keep", type=int, default=128)
+    sp.add_argument("--fail-under", type=float, default=0.98,
+                    help="fail if the recovered-norm top-k overlap with explicit "
+                         "unweighted norms falls below this fraction")
 
     a = p.parse_args()
     {"profile": cmd_profile, "mask": cmd_mask, "eval": cmd_eval,
