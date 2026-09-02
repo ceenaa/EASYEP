@@ -65,6 +65,13 @@ ACCUMULATION_MODE = "torch-deterministic-index-add-v1"
 MODEL_IDENTITY_SCHEMA_VERSION = 1
 MAX_ERROR_SAMPLES_PER_LAYER_PER_RANK = 10_000
 MHC_SCORE_CHUNK_TOKENS = 1024
+# Indexer.forward scores the whole prefill unblocked and materialises
+# [1,T,n_local_heads,T/4] bf16 twice, so the transient is ~16*T^2 bytes against
+# ~35 GiB of headroom on 4xH100 (weights are 43.5 GiB/rank). 16384 costs 4.9 GiB
+# and 24576 costs 11.0 GiB; 65280 costs 77.4 GiB and OOMs. The launcher caps this
+# too, but standalone invocations bypass the launcher, so enforce it here where
+# every mode passes through.
+MAX_SUPPORTED_SEQ_LEN = 24576
 
 
 @contextmanager
@@ -993,6 +1000,15 @@ def build(ckpt_path: str, config_path: str, code_dir: str, max_seq_len: int, max
                  or not math.isfinite(temperature)
                  or temperature < 0)):
         raise ValueError("temperature must be finite and >= 0")
+    if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int) or max_seq_len < 2:
+        raise ValueError("max_seq_len must be an integer >= 2")
+    if max_seq_len > MAX_SUPPORTED_SEQ_LEN:
+        raise ValueError(
+            f"max_seq_len={max_seq_len} exceeds the {MAX_SUPPORTED_SEQ_LEN} supported "
+            f"on this topology: prefill memory is quadratic and unblocked (~16*T^2 "
+            f"bytes), so this would need roughly {16 * max_seq_len ** 2 / 2**30:.1f} GiB "
+            f"of transient against ~35 GiB of headroom. Token-exact chunking already "
+            f"preserves whole sources, so a smaller window costs no coverage.")
     sys.path.insert(0, code_dir)
     import model as official  # noqa: E402
 
@@ -1133,80 +1149,46 @@ def cmd_mask(a) -> None:
 
 
 def cmd_eval(a) -> None:
+    """Standalone single-variant generation.
+
+    Delegates to _evaluate rather than repeating it. The previous copy built its
+    prompt as ``q.get("question") or q.get("prompt") or json.dumps(q)``; the real
+    question records carry neither field, so every prompt became a JSON dump of
+    the whole record -- reference answer, CWE and grading rubric included. Two
+    evaluation paths over the same data is what let that survive, so there is
+    now only one.
+    """
     official, model, tok, args, rank, world_size = build(
         a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1,
         getattr(a, "temperature", None)
     )
     sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
-    from encoding_dsv4 import encode_messages, parse_message_from_completion_text
+    from encoding_dsv4 import encode_messages
     sys.path.insert(0, a.code_dir)
     from generate import generate
 
-    prof = Profiler(args.n_layers, args.n_routed_experts, torch.device("cuda"))
+    dev = torch.device("cuda")
+    prof = Profiler(args.n_layers, args.n_routed_experts, dev)
     patch(official, prof)
 
-    mask = json.loads(Path(a.mask).read_text()) if a.mask else None
-    set_mask(model, mask, args.n_hash_layers, torch.device("cuda"))
+    mask = json.loads(Path(a.mask).read_text(encoding="utf-8")) if a.mask else None
     tag = "pruned" if mask else "full"
+    # _evaluate reports the retained-expert count. Take it from the mask itself
+    # so this mode needs no separate --keep that could drift out of agreement.
+    a.keep = (mask.get("keep_per_layer", args.n_routed_experts) if mask
+              else args.n_routed_experts)
 
-    questions = json.loads(Path(a.questions).read_text(encoding="utf-8"))
-    if isinstance(questions, dict):
-        questions = questions.get("questions", [])
-    if a.limit:
-        questions = questions[: a.limit]
-    if not questions:
-        raise ValueError("evaluation question set is empty")
-    input_limit = a.max_seq_len - a.max_new_tokens
-    if a.max_new_tokens < 1 or input_limit < 1:
-        raise ValueError("max_seq_len leaves no room for evaluation generation")
-
-    prepared = []
-    for i, q in enumerate(questions):
-        text = q if isinstance(q, str) else (q.get("question") or q.get("prompt") or json.dumps(q))
-        qid = None if isinstance(q, str) else q.get("id")
-        prompt = encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
-        ids = tok.encode(prompt)
-        if len(ids) > input_limit:
-            raise ValueError(
-                f"evaluation item {i} has {len(ids)} prompt tokens but only {input_limit} "
-                "fit with the response reservation; refusing to truncate")
-        prepared.append((i, text, qid, ids))
-
-    out_path = Path(a.out)
+    out = Path(a.out)
     if rank == 0:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        # A rerun is a replacement experiment, not another page of the same one.
-        # Appending silently duplicates rows and invalidates aggregate metrics.
-        fp = out_path.open("w", encoding="utf-8")
+        out.mkdir(parents=True, exist_ok=True)
 
-    for i, text, qid, ids in prepared:
-        sample_seed = getattr(a, "seed", 965) + i
-        torch.manual_seed(sample_seed)
-        torch.cuda.manual_seed_all(sample_seed)
-        t0 = time.time()
-        with torch.inference_mode():
-            out = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
-        completion, _n_completion = _decode_completion(tok, out, ids)
+    def say(m):
         if rank == 0:
-            fp.write(json.dumps({
-                "variant": tag,
-                "index": i,
-                "id": qid,
-                "question": text,
-                "completion": completion,
-                "message": parse_message_from_completion_text(completion, thinking_mode="chat"),
-                "seed": sample_seed,
-                "temperature": args.temperature,
-                "seconds": round(time.time() - t0, 2),
-            }) + "\n")
-            fp.flush()
-            print(f"[easyep:{tag}] {i+1}/{len(questions)}  {time.time()-t0:.1f}s", flush=True)
+            print(f"[easyep] {m}", flush=True)
 
-    if rank == 0:
-        fp.close()
-        print(f"[easyep] wrote {out_path}", flush=True)
-    if world_size > 1:
-        dist.destroy_process_group()
+    # _evaluate applies the mask, seeds per question, and destroys the group.
+    _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
+              encode_messages, generate, [(tag, mask)])
 
 
 # ------------------------------------------------------------------- prompts
@@ -2851,7 +2833,9 @@ def main() -> None:
         sp.add_argument("--ckpt-path", required=True)
         sp.add_argument("--config", required=True)
         sp.add_argument("--code-dir", required=True, help="the model's inference/ directory")
-        sp.add_argument("--max-seq-len", type=int, default=8192)
+        sp.add_argument("--max-seq-len", type=int, default=16384,
+                        help=f"context window; at most {MAX_SUPPORTED_SEQ_LEN} "
+                             "because prefill memory is quadratic and unblocked")
         sp.add_argument("--limit", type=int, default=0)
 
     sp = sub.add_parser("profile", help="calibration -> expert scores")
@@ -2883,7 +2867,9 @@ def main() -> None:
     common(sp)
     sp.add_argument("--questions", required=True)
     sp.add_argument("--mask", default="")
-    sp.add_argument("--out", required=True)
+    sp.add_argument("--out", required=True,
+                    help="output DIRECTORY; writes answers_<tag>.jsonl and "
+                         "summary.json, the same layout the pipeline emits")
     sp.add_argument("--max-new-tokens", type=int, default=256)
     sp.add_argument("--seed", type=int, default=965,
                     help="item i is decoded with manual_seed(seed+i)")

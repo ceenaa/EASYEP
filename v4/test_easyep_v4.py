@@ -843,6 +843,58 @@ def t_pair_blind_includes_exact_judge_input_and_rejects_incomplete_rows():
 # ------------------------------------------------ checkpoint allowlist
 
 
+def t_evaluation_prompt_never_carries_the_answer():
+    """The prompt must not hand the model the reference answer or the rubric.
+
+    cmd_eval once built prompts as ``json.dumps(question)``, which put
+    expected_reasoning, vulnerability and every *_terms grading list straight
+    into the prompt. Both evaluation paths now share question_text.
+    """
+    q = {
+        "id": "Q01", "language": "JavaScript", "title": "reflected xss",
+        "snippet": "app.get('/hello', (req, res) => res.send(req.query.name));",
+        "cwe": "CWE-79", "vulnerability": "Cross-site scripting",
+        "expected_reasoning": "An attacker controls req.query.name ...",
+        "accepted_terms": ["cross-site scripting", "xss", "cwe-79"],
+        "sink_terms": ["res.send"], "source_terms": ["req.query"],
+        "impact_terms": ["session"], "remediation_terms": ["escape"],
+        "specificity_terms": ["context-aware"],
+    }
+    prompt = E.question_text(q)
+    assert q["snippet"] in prompt, "the code under review must be in the prompt"
+    leaks = ("expected_reasoning", "accepted_terms", "sink_terms", "source_terms",
+             "impact_terms", "remediation_terms", "specificity_terms",
+             "vulnerability")
+    for key in leaks:
+        assert key not in prompt, f"field name {key} leaked into the prompt"
+    for value in ("An attacker controls", "Cross-site scripting", "cross-site scripting"):
+        assert value not in prompt, f"answer text {value!r} leaked into the prompt"
+    # and the mode that used to leak must delegate rather than build its own
+    import inspect
+    body = inspect.getsource(E.cmd_eval).replace(E.cmd_eval.__doc__ or "", "")
+    assert "json.dumps(" not in body, \
+        "cmd_eval reintroduced an independent prompt construction"
+    assert "_evaluate(" in body, "cmd_eval no longer delegates to _evaluate"
+
+
+def t_build_rejects_a_context_window_that_would_oom():
+    """The launcher caps MAX_SEQ_LEN, but standalone modes bypass the launcher."""
+    assert E.MAX_SUPPORTED_SEQ_LEN == 24576
+    must_raise(ValueError,
+               lambda: E.build("ckpt", "cfg", "code", 65536, 1),
+               "exceeds")
+    must_raise(ValueError,
+               lambda: E.build("ckpt", "cfg", "code", 0, 1),
+               "max_seq_len")
+    # a supported window gets past the guard and fails later, on the real load
+    try:
+        E.build("ckpt", "cfg", "code", E.MAX_SUPPORTED_SEQ_LEN, 1)
+    except ValueError as exc:
+        raise AssertionError(f"supported window was rejected: {exc}")
+    except Exception:
+        pass
+
+
 def t_no_heuristic_scoring_remains():
     """The runs must emit completions, not grades."""
     assert not hasattr(E, "score_completion"), "heuristic rubric is back"

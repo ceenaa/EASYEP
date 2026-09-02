@@ -269,7 +269,7 @@ The main environment overrides are:
 | `KEEP` | `128` | experts retained in each prunable layer |
 | `N_CALIB` | `25` | calibration source files; token-exact chunking may produce more profiling trajectories |
 | `N_PAIRS` | `25` | matched vulnerable/secure pairs |
-| `MAX_SEQ_LEN` | `16384` | context window used by each stage. Not the config's `original_seq_len=65536`: prefill memory is quadratic and unblocked (~`16*T^2` bytes) against ~35 GiB of headroom, so 65536 OOMs and ~24576 is the ceiling. Token-exact chunking preserves whole sources, so a smaller window costs no coverage |
+| `MAX_SEQ_LEN` | `16384` | context window used by each stage. Not the config's `original_seq_len=65536`: prefill memory is quadratic and unblocked (~`16*T^2` bytes) against ~35 GiB of headroom, so 65536 OOMs and 24576 is the ceiling, enforced by both the launcher and `build()`. Token-exact chunking preserves whole sources, so a smaller window costs no coverage |
 | `MAX_NEW_TOKENS` | `256` | question-evaluation response limit |
 | `PAIR_MAX_NEW_TOKENS` | `128` | matched-pair response limit |
 | `MAX_CHUNKS` | `0` | calibration chunks per file; `0` means unlimited and a positive value is a fail-fast cap |
@@ -323,7 +323,11 @@ Outputs are grouped under `$EASYEP_RESULTS_ROOT/run_RUN_ID/`:
 | `judge/{questions,pairs}/` | anonymised judging bundle and separate withheld key |
 
 Standalone modes remain available for development, but the documented Slurm
-entrypoint always runs both correctness gates and the full workflow.
+entrypoint always runs both correctness gates and the full workflow. `eval`
+delegates to the pipeline's own evaluation routine, so it shares the prompt
+construction, per-question seeding and row schema rather than keeping a second
+copy that can drift; its `--out` is a directory and it writes the same
+`answers_<tag>.jsonl` plus `summary.json` layout.
 
 ## Evaluated variants
 
@@ -360,7 +364,7 @@ frequency, and random controls.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 50 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 52 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask
@@ -372,7 +376,9 @@ prompt-plus-response profiling, the discrimination metric (including that a
 constant "VULNERABLE" answerer scores J=0), label-neutral paired inputs,
 calibration/matched-pair disjointness, path-traversal rejection, portable
 checkpoint provenance and full-hash verification, parity-threshold validation,
-blinding, the checkpoint allowlist, and the inlined `hc_post` algebra used by
+blinding (including that the matched-pair label is withheld), that no evaluation
+prompt carries the reference answer or grading rubric, the context-window
+ceiling, the checkpoint allowlist, and the inlined `hc_post` algebra used by
 the primary mHC-aware score.
 
 ## Judging

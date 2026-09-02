@@ -293,7 +293,9 @@ mkdir -p "$RESULTS_ROOT"
 # an existing directory, so a resume is always a deliberate act.
 RESUME=${RESUME:-0}
 if [[ $RESUME == 1 && -d $OUT ]]; then
-  require_dir "$OUT/.stages"
+  # A run that died before stage setup has no .stages; that means nothing
+  # completed, not that the resume is invalid, so create it and re-run all.
+  mkdir -p "$OUT/.stages"
   require_file "$OUT/RUN_MANIFEST.json"
   # Stages already on disk were produced under the earlier parameters. Resuming
   # with different ones would silently splice incompatible halves together.
