@@ -1,0 +1,7 @@
+# Reproducible pins satisfying the official V4-Flash inference requirements.
+# Keep this environment separate from the repository's DeepSeek-R1 environment.
+torch==2.10.0
+transformers==5.0.0
+safetensors==0.7.0
+fast-hadamard-transform==1.1.0
+tilelang==0.1.8

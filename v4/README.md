@@ -8,6 +8,89 @@ This is an *adaptation*, not a port: V4-Flash differs from R1 in four ways that
 each touch the scoring path. Nothing under `pruning/`, `sglang/` or `configs/` is
 modified — the R1 pipeline is left intact and all V4 work is confined to `v4/`.
 
+## Reproducible setup
+
+The V4 path does **not** use the R1 environment documented in the repository-level
+README. In particular, Torch 2.4 and Transformers 4.x cannot load the official
+V4 FP4 inference implementation. The pins in `v4/requirements-v4.txt` satisfy
+the requirements shipped with the official model snapshot.
+
+The reference implementation and configuration are pinned to
+[`deepseek-ai/DeepSeek-V4-Flash-0731` revision
+`9e165c30e2704aec5d9d593cce3eebd58bbef1cb`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/tree/9e165c30e2704aec5d9d593cce3eebd58bbef1cb).
+`v4/config_v4_flash.json` is the checked-in copy of that revision's
+`inference/config.json`; the launchers use the checked-in copy.
+
+On Compute Canada, create a separate virtual environment with an available
+Python 3.10+ module and CUDA 13.2. Set `PYTHON_MODULE` to the exact versioned
+module at your site when possible, and reuse the same value for submission:
+
+```bash
+export PYTHON_MODULE=python
+export CUDA_MODULE=cuda/13.2
+module load "$PYTHON_MODULE" "$CUDA_MODULE"
+python -m venv "$PROJECT/easyep-v4-venv"
+"$PROJECT/easyep-v4-venv/bin/python" -m pip install --upgrade pip
+"$PROJECT/easyep-v4-venv/bin/python" -m pip install -r v4/requirements-v4.txt
+```
+
+Download the pinned Hugging Face snapshot and convert it to four model-parallel
+shards with the conversion script from the same snapshot:
+
+```bash
+export MODEL_REVISION=9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+export HF_MODEL="$PROJECT/DeepSeek-V4-Flash-0731-hf"
+export EASYEP_CHECKPOINT="$PROJECT/DeepSeek-V4-Flash-0731-mp4"
+
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --revision "$MODEL_REVISION" --local-dir "$HF_MODEL"
+"$PROJECT/easyep-v4-venv/bin/python" "$HF_MODEL/inference/convert.py" \
+  --hf-ckpt-path "$HF_MODEL" \
+  --save-path "$EASYEP_CHECKPOINT" \
+  --n-experts 256 --model-parallel 4 --expert-dtype fp4
+
+# Run once after conversion. This fully hashes the large converted shards and
+# verifies that the Hugging Face local-dir metadata names the pinned commit.
+"$PROJECT/easyep-v4-venv/bin/python" v4/checkpoint_provenance.py create \
+  --checkpoint "$EASYEP_CHECKPOINT" --source-snapshot "$HF_MODEL" \
+  --model-id deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --model-revision "$MODEL_REVISION" --inference-revision "$MODEL_REVISION" \
+  --nproc 4
+```
+
+Create the provenance record in a compute allocation with enough wall time for
+one complete read of the converted checkpoint. Normal experiment jobs validate
+the record and exact shard metadata without rehashing hundreds of GiB. For a
+fresh byte-for-byte audit (which deliberately tolerates harmless mtime changes),
+run:
+
+```bash
+"$PROJECT/easyep-v4-venv/bin/python" v4/checkpoint_provenance.py verify \
+  --checkpoint "$EASYEP_CHECKPOINT" --full \
+  --config v4/config_v4_flash.json --source-snapshot "$HF_MODEL" \
+  --model-id deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --model-revision "$MODEL_REVISION" --inference-revision "$MODEL_REVISION" \
+  --nproc 4
+```
+
+After `create` succeeds, the original Hugging Face weight shards may be removed
+to save storage. Keep the snapshot's `inference/` and `encoding/` directories
+and their `.cache/huggingface/download` metadata because every job revalidates
+the exact upstream sources it executes.
+
+The experiment data is prepared separately. Its root must have this layout:
+
+```text
+inputs/
+├── questions_used.json
+└── vulnerable-js-files/
+    ├── CODEQL_SECURE_MANIFEST.jsonl
+    └── ... source files named by the manifest ...
+```
+
+The run manifest hashes every file in `vulnerable-js-files/`, so a run remains
+auditable even when the dataset is stored outside Git.
+
 ## Scope of this first version
 
 | | |
@@ -20,30 +103,49 @@ modified — the R1 pipeline is left intact and all V4 work is confined to `v4/`
 ## The score
 
 The paper's score is a sum of per-token **products**
-(`pruning/expert_selection.py:38` upstream):
+(`pruning/expert_selection.py:38` upstream). V4's residual state has four mHC
+copies, so the architecture-faithful adaptation measures both the token
+contribution and expert-output norm in that residual space:
 
 ```python
-score[layer, e] += weight_t[e] * simibr_t * norm_t[e]
+score[layer, e] += weight_t[e] * simibr_mhc_t * residual_norm_t[e]
 ```
 
 | term | meaning |
 |---|---|
 | `weight` | gating score for expert `e` on token `t` |
-| `norm`   | ‖unweighted expert output‖₂ |
-| `simibr` | `max(1 − cos(h, h + y_routed), 0)` — token contribution |
+| `residual_norm` | ‖unweighted expert output‖₂ after `hc_post` maps it into the four-copy residual |
+| `simibr_mhc` | `max(1 − cos(h_mhc, h_mhc + y_routed_mhc), 0)` — token contribution in the actual V4 residual state |
 
 Implemented in `easyep_v4.py`:
 
 - `moe_forward` — collects per-token `weights`, `indices`, and unweighted `norms`
 - `moe_accumulate` — forms the product and adds it to the running score
-- `block_forward` — supplies `h`, the pre-FFN residual, so `simibr` is computable
+- `block_forward` — supplies the `hc_pre`/`hc_post` coefficients needed to map
+  the routed contribution back into mHC residual space
 
 The accumulation must happen per token. A previous attempt accumulated `Σweight`
 and `Σnorm` into separate marginal buffers and ranked by the latter; a product-sum
 cannot be recovered from marginals, and that variant drops `simibr` entirely.
-For comparison, `score_no_simibr` (= `Σ weight·norm`) is recorded in the **same
-calibration pass**, so the effect of the token-contribution term is measurable
-without a second run and without calibration variance between the two.
+For comparison, `score_no_simibr` (= `Σ weight·residual_norm`) and the old
+reduced-vector approximation (`score_reduced_legacy`) are recorded in the **same
+calibration pass**. This isolates the scoring definition without adding
+calibration variance. `score_mhc` is a compatibility alias of the primary
+schema-v2 `score`, not a separate score.
+
+Calibration follows the paper's prompt-plus-response trajectory rather than
+profiling prompt prefills alone. For each seeded, CWE-stratified source file,
+the implementation first generates a response with profiling disabled, then
+teacher-forces the exact prompt and generated response once with profiling
+enabled. Token-exact chunking preserves the whole source; `MAX_CHUNKS=0` is
+unlimited, while exceeding a positive cap fails instead of silently dropping a
+file tail. A source that does not fit therefore becomes multiple independent
+prompt-plus-response trajectories: `N_CALIB=25` means 25 source files, not
+necessarily 25 forwards. The score artifact records the seed, decoding limits,
+exact selected source hashes, prompt-token hashes, generated-response token
+hashes, and the resulting file, chunk, forward, and generated-token counts.
+Later stages reject the artifact unless all schema-v2, model, implementation,
+and calibration provenance checks pass.
 
 `score_comparison.json` reports, for every layer 3–42:
 
@@ -65,15 +167,14 @@ layers where the token-contribution term matters most are immediately visible.
 R1 uses `sigmoid`; V4 uses `F.softplus(scores).sqrt()` with a `noaux_tc` bias that
 shifts top-k selection but not the returned routing weights. `gate_forward` mirrors
 upstream V4 exactly and adds only an optional keep-mask applied to the scores
-before `topk`. The returned `weights` are unchanged in meaning, so the score
-formula carries over as-is.
+before `topk`. The returned `weights` are unchanged in meaning, so the score's
+multiplicative gate-weight term carries over.
 
 ### 2. mHC residuals
 
-V4 maintains `hc_mult = 4` copies of the hidden state. This turns out **not** to
-need an aggregation choice: `Block.hc_pre` reduces the 4 copies to a single vector
-*before* the FFN and `hc_post` re-expands *after*, so inside the FFN sub-block the
-stream is one vector per token, exactly as in R1.
+V4 maintains `hc_mult = 4` copies of the hidden state. `Block.hc_pre` reduces the
+four copies to a single vector before the FFN, but `hc_post` distributes the FFN
+output back into the four-copy residual using token-dependent coefficients:
 
 ```python
 residual = x                              # [b,s,hc,d]
@@ -83,8 +184,11 @@ x = self.ffn(x, input_ids)                # [b,s,d]
 x = self.hc_post(x, residual, post, comb) # [b,s,hc,d]
 ```
 
-`h` is the pre-norm reduced residual, matching upstream's use of the pre-norm
-residual rather than the normed FFN input.
+The expert output is computed in the reduced stream, but its contribution to the
+model state is the `hc_post`-mapped vector. The primary score therefore computes
+`simibr` and the corresponding output norm after that mapping. The literal
+reduced-stream `h -> h + y_routed` score remains available only as
+`score_reduced_legacy` for comparison.
 
 ### 3. Hash-routed layers 0–2
 
@@ -98,104 +202,196 @@ are dense MLPs — different reason, same range.)
 
 Experts are stored `float4_e2m1fn_x2` — two values per byte, with a per-32
 `float8_e8m0fnu` block scale. This does **not** affect masking, which is why this
-version validates by masking first. It will matter for actual deletion: removing
-an expert means repacking rather than slicing, since expert boundaries need not
-land on byte boundaries.
+version validates by masking first. Packing is internal to each expert tensor, so
+removing a whole expert does not require bit-level repacking across expert
+boundaries. Actual deletion still requires selecting and renumbering expert
+tensors, re-sharding the checkpoint, and updating router/config mappings; that is
+not implemented here.
 
 Two consequences already handled:
 
 - V4 folds the gating weight *inside* `Expert.forward`, computing
-  `w2(w · silu(gate)·up)`. Since `w2` is linear, the output is exactly
-  `w × unweighted`, so the unweighted norm is recovered by dividing by `w`
-  rather than paying a second forward pass.
+  `w2(w · silu(gate)·up)`. In exact arithmetic, linearity would make this
+  `w × unweighted`, permitting norm recovery by division. FP4 activation
+  quantisation can break exact proportionality, so the mandatory `validate`
+  gate checks the shortcut against explicit unweighted forwards.
 - V4's `MoE.forward` returns routed + shared summed. `simibr` needs the routed
   part alone, so it is stashed on the module for `Block` to read.
 
 ## Running it
 
+From the repository root, export absolute site-specific paths. `EASYEP_CODE_DIR` must
+point to the `inference/` directory from the pinned Hugging Face snapshot, while
+`EASYEP_CHECKPOINT` must point to its four-way converted checkpoint:
+
 ```bash
-sbatch v4/easyep.sbatch      # profile -> mask -> eval(full) -> eval(pruned), one model load
+export EASYEP_REPO="$PWD"
+export EASYEP_VENV="$PROJECT/easyep-v4-venv"
+export HF_MODEL="$PROJECT/DeepSeek-V4-Flash-0731-hf"
+export EASYEP_CODE_DIR="$HF_MODEL/inference"
+export EASYEP_CHECKPOINT="$PROJECT/DeepSeek-V4-Flash-0731-mp4"
+export EASYEP_DATA_ROOT="$SCRATCH/deepseek_easy_ep/inputs"
+export EASYEP_RESULTS_ROOT="$SCRATCH/deepseek_easy_ep/results"
+export MODEL_ID=deepseek-ai/DeepSeek-V4-Flash-0731
+export MODEL_REVISION=9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+export PYTHON_MODULE=python       # replace with the exact setup module when available
+export CUDA_MODULE=cuda/13.2
+
+# Replace YOUR_ALLOCATION with the Compute Canada allocation for this run.
+sbatch --account=YOUR_ALLOCATION --export=ALL v4/easyep.sbatch
 ```
 
-The four phases share a single model load; on Rorqual that load is ~15 minutes,
-so splitting them into separate jobs would triple the dominant cost.
+`easyep.sbatch` is a compatibility wrapper around `run_experiment.sbatch`; both
+execute the same complete workflow:
 
-Outputs, under `--out`:
+```text
+parity (gate) -> validate (gate) -> profile -> question eval -> pair eval -> blind
+```
 
-| file | contents |
+Each GPU stage uses a fresh `torchrun` process. The profile is performed once and
+the resulting `expert_scores.pt` is reused for both evaluation suites. Either gate
+failing stops the job before profiling or evaluation. Slurm writes
+`easyep-easyep_v4-JOB_ID.out` in the submission directory unless `sbatch --output`
+overrides it.
+
+The main environment overrides are:
+
+| variable | default | meaning |
+|---|---:|---|
+| `KEEP` | `128` | experts retained in each prunable layer |
+| `N_CALIB` | `25` | calibration source files; token-exact chunking may produce more profiling trajectories |
+| `N_PAIRS` | `25` | matched vulnerable/secure pairs |
+| `MAX_SEQ_LEN` | `4096` | model context limit used by each stage |
+| `MAX_NEW_TOKENS` | `256` | question-evaluation response limit |
+| `PAIR_MAX_NEW_TOKENS` | `128` | matched-pair response limit |
+| `MAX_CHUNKS` | `0` | calibration chunks per file; `0` means unlimited and a positive value is a fail-fast cap |
+| `SEED` | `965` | calibration ordering, controls, and paired decoding seed |
+| `TEMPERATURE` | unset | keep the model default (`1.0`); set `0` for greedy decoding |
+| `RUN_ID` | Slurm job id | suffix of the unique output directory |
+| `MASTER_PORT_BASE` | job-derived | first of the per-stage rendezvous ports |
+| `PYTHON_MODULE` | `python` | module used to create and run the V4 virtual environment |
+| `CUDA_MODULE` | `cuda/13.2` | CUDA module loaded in the job |
+
+The launcher refuses to overwrite an existing `run_RUN_ID` directory and, for a
+Git checkout, refuses tracked or staged changes. Its compact `RUN_MANIFEST.json`
+content-hashes the executing EASY-EP files, official inference/encoding trees,
+configuration, tokenizers, questions, pair manifest, and complete input data
+tree. The required checkpoint provenance sidecar records full SHA-256 hashes for
+every converted shard, the pinned commit recorded by the Hugging Face local-dir
+metadata, and content-derived identifiers for the critical upstream source
+files. Each job verifies its model/revision declarations, exact shard metadata,
+and the currently executed inference sources against that record, then records
+the checkpoint's portable content identity in `RUN_MANIFEST.json`. This avoids
+rereading the entire checkpoint on every launch without reducing provenance to
+a path or timestamp claim. Immediately before every model process, the launcher
+rechecks the sidecar, runtime-file hashes, official source trees, and input-tree
+hashes against the run manifest; any mid-job change aborts the workflow.
+
+Outputs are grouped under `$EASYEP_RESULTS_ROOT/run_RUN_ID/`:
+
+| path | contents |
 |---|---|
-| `expert_scores.pt` | per-layer/expert `score`, `score_no_simibr`, `counts`, `gate_sums` |
-| `mask_keep128.json` | kept/pruned expert ids per layer |
-| `mask_keep128_no_simibr.json` | same, ranked without the token-contribution term |
-| `score_comparison.json` | **per-layer** top-128 overlap between the two scorings |
-| `answers_full.jsonl` | 50 questions, unmasked |
-| `answers_pruned.jsonl` | 50 questions, masked |
-| `summary.json` | term-overlap rubric per variant |
+| `RUN_MANIFEST.json` | provenance, parameters, status, completed stages, and artifact paths |
+| `parity/parity.json` | instrumentation parity gate report |
+| `norm_validation/norm_validation.json` | recovered-vs-explicit norm gate report |
+| `norm_validation/validation_scores.pt` | validation score tensors |
+| `scores/expert_scores.pt` | all score tensors, counts, gate sums, and score-schema metadata |
+| `scores/mask_keep{KEEP}.json` | primary mask from profiling |
+| `scores/mask_keep{KEEP}_no_simibr.json` | no-`simibr` mask from profiling |
+| `scores/score_comparison.json` | per-layer overlap between primary and no-`simibr` rankings |
+| `questions/answers_*.jsonl` | question completions for every variant, including the exact prompt, snippet, references, decoding seed/settings, token counts, and prompt hashes |
+| `questions/mask_*.json` | masks rebuilt from the saved score artifact |
+| `questions/summary.json` | question-evaluation summary and decoding settings |
+| `pairs/pairs_*.jsonl` | matched-pair completions for every variant, including the exact neutral display path, source snippet, review prompt, and their hashes |
+| `pairs/pairs_used.json` | exact selected pair identities, paths, labels, source/prompt text and hashes, prompt-token hashes/counts, decoding settings, and score/calibration provenance |
+| `pairs/pairs_summary.json` | coverage-aware discrimination metrics, decoding settings, and score provenance |
+| `judge/{questions,pairs}/` | anonymised judging bundle and separate withheld key |
 
-Standalone modes (`profile`, `mask`, `eval`) exist for iterating on one stage.
+Standalone modes remain available for development, but the documented Slurm
+entrypoint always runs both correctness gates and the full workflow.
 
 ## Evaluated variants
 
-Three, all decoded under identical per-question seeds:
+All variants are decoded under identical per-item seeds:
 
 | tag | mask |
 |---|---|
 | `full` | none - all 256 experts |
-| `pruned_paper` | top-128 by `weight x simibr x norm` (the paper's rule) |
-| `pruned_mhc` | top-128 by `weight x simibr_mhc x norm` - simibr measured in the hc residual space |
-| `pruned_no_simibr` | top-128 by `weight x norm` (the earlier port's rule) |
-| `pruned_frequency` | top-128 by selection count - the naive heuristic |
-| `pruned_random` | seeded random 128 - the floor |
+| `pruned_paper` | top-`KEEP` by the mHC-aware V4 adaptation of `weight x simibr x norm` |
+| `pruned_reduced_legacy` | top-`KEEP` by the old reduced-vector approximation, when present in the score artifact |
+| `pruned_no_simibr` | top-`KEEP` by `weight x residual_norm` |
+| `pruned_frequency` | top-`KEEP` by selection count - the naive heuristic |
+| `pruned_random` | seeded random `KEEP` - the floor |
 
 The two controls answer different questions. `pruned_frequency` asks whether the
 paper's machinery beats the obvious "keep what gets picked most". `pruned_random`
 asks whether the scoring carries any signal at all -- if it ties the scored masks,
 the model is simply robust to expert removal and no scoring rule is doing work.
-Measured mask overlap against `pruned_paper`: no_simibr 94.5%, frequency 88.6%,
-random 49.7% (chance, as it should be).
+Schema-v1 overlap numbers are not comparable to the mHC-aware primary score and
+must be regenerated from a schema-v2 run.
 
-`score_comparison.json` shows the two rules *disagree*; running both shows which
-one selects better experts. Use `--skip-alt-eval` to drop the third variant.
+Matched-pair selection excludes every source file selected for calibration, so
+the discrimination evaluation cannot reuse a profiled program. The selected
+paths and their content/token identities are persisted in `pairs_used.json`.
+
+`score_comparison.json` shows where the primary and no-`simibr` rules disagree;
+running both measures whether the token-contribution term helps. The standalone
+`pipeline` and `pairs` modes accept `--no-controls` to omit only the frequency and
+random controls.
 
 ## Tests
 
 ```bash
-python v4/test_easyep_v4.py      # 20 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 47 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask
 construction and partitioning, hash-layer protection, the frequency and random
-baselines, the discrimination metric (including that a constant "VULNERABLE"
-answerer scores J=0), blinding, the checkpoint allowlist, and the inlined
-`hc_post` algebra used by the mHC variant.
+baselines, schema rejection, seeded calibration sampling, token-exact chunking,
+prompt-plus-response profiling, the discrimination metric (including that a
+constant "VULNERABLE" answerer scores J=0), label-neutral paired inputs,
+calibration/matched-pair disjointness, path-traversal rejection, portable
+checkpoint provenance and full-hash verification, parity-threshold validation,
+blinding, the checkpoint allowlist, and the inlined `hc_post` algebra used by
+the primary mHC-aware score.
 
 ## Judging
 
-The runs generate; they do not grade. There is no built-in quality metric --
+The question runs generate; they do not grade. There is no built-in question-quality metric --
 `answers_*.jsonl` holds the question, the snippet, the reference answer and the
 completion, and nothing that scores it.
 
 ```bash
-easyep_v4.py blind --results results/easyep_keep128_v2 \
-                   --questions inputs/questions_used.json \
-                   --out judge/questions
+"$EASYEP_VENV/bin/python" v4/easyep_v4.py blind \
+  --results "$EASYEP_RESULTS_ROOT/run_JOB_ID/questions" \
+  --questions "$EASYEP_DATA_ROOT/questions_used.json" \
+  --out "$EASYEP_RESULTS_ROOT/run_JOB_ID/judge/questions"
 ```
 
-`to_judge.jsonl` is one line per (item, system): snippet, completion, an opaque
-system label, and a separate `reference` block. The variant mapping is withheld
-in `KEY_do_not_open_until_graded.json`, so a judge cannot see which system it is
-reading. Grade it with whatever judge you like, then join on `uid` and open the
-key.
+`to_judge.jsonl` is one line per (item, system): snippet, exact prompt,
+completion, an opaque system label, and (for the question set) a separate
+`reference` block. Paired judging refuses legacy completion rows that omit the
+snippet or prompt, rather than emitting an answer that a reasoning judge cannot
+assess. The variant mapping is withheld
+in the mode-0600 `KEY_do_not_open_until_graded.json`. Public UIDs are keyed with
+a random HMAC salt stored only in that withheld file, so the published variant
+names cannot be brute-forced from a judging bundle. Grade it with whatever judge
+you like, then join on `uid` and open the key.
 
-The one number that is still computed, because it needs no judge: the matched-pair
-eval parses the `Verdict:` line and scores it against CodeQL ground truth
-(TPR / FPR / Youden's J). The raw completions are saved either way, so a judge can
-override that reading. Pass `--no-controls` or ignore `pairs_summary.json` if you
-would rather have nothing precomputed at all.
+The one result that is still computed, because it needs no judge: the matched-pair
+eval parses the `Verdict:` line and scores it against CodeQL ground truth. The
+headline TPR, TNR, balanced accuracy, and Youden's J penalise unparsed verdicts.
+`fpr_explicit_vulnerable` counts only explicit false alarms,
+`safe_abstention_rate` reports rejected SAFE items separately, and
+`safe_error_rate = 1 - TNR` is the rate used with TPR in Youden's J. The raw
+completions are saved either way, so a judge can override that reading. Pass
+`--no-controls` or ignore `pairs_summary.json` if you would rather have nothing
+precomputed at all.
 
 ## Correctness gates
 
-Run before anything else; the later jobs are Slurm-gated on the first.
+`run_experiment.sbatch` runs these sequentially in one Slurm job. Shell fail-fast
+handling prevents profiling and evaluation from starting if either gate fails.
 
 | gate | what it rules out |
 |---|---|
@@ -209,23 +405,20 @@ references to the trunk embedding and head (`Transformer.__init__` assigns
 
 ## Open items
 
-- **Paired decoding.** `config.json` sets no `temperature`, so `ModelArgs`
+- **Paired decoding.** `config_v4_flash.json` sets no `temperature`, so `ModelArgs`
   defaults to 1.0 and `Transformer.forward` samples every token via Gumbel-max,
   which consumes RNG. Seeding once at load would decode `full` and `pruned` under
   different noise and confound the comparison. Question *i* is therefore decoded
-  under `manual_seed(seed + i)` in **both** variants; `--temperature 0` gives
-  greedy decoding if an entirely noise-free A/B is wanted. The regime used is
-  recorded in `summary.json._decoding`.
-
-
+  under `manual_seed(seed + i)` in **every** variant; submit with `TEMPERATURE=0`
+  for greedy decoding if an entirely noise-free A/B is wanted. The regime used is
+  recorded in `questions/summary.json` under `_decoding`.
 - **MTP layers are excluded, not handled.** `DSparkBlock.forward` delegates to
   `Block.forward` when `start_pos > 0` with `layer_id` 43–45; the accumulator is
   bounds-guarded against that. They have their own experts under the `mtp.*`
   namespace and warrant their own profiling and pruning decision.
 - **No weight deletion.** Masking only, by design.
-- **Calibration size.** 25 files stratified across CWE directories, matching the
-  paper's 25 samples. Not yet swept.
-- **`simibr` reference point.** `h` is the pre-`ffn_norm` reduced residual. The
-  alternative — comparing in the post-`hc_post` `[b,s,hc,d]` space, with and
-  without the routed term — is closer to V4's true residual dynamics but compares
-  in a different space. Worth a look if scores appear insensitive to `simibr`.
+- **Calibration size.** The default is 25 seeded, shuffled source files stratified
+  across CWE directories, matching the paper's source-sample count. Token-exact
+  chunking can expand those files into more than 25 profiled trajectories; both
+  counts are recorded and must be reported for a literal comparison. The size
+  has not yet been swept.

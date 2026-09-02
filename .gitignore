@@ -1,0 +1,7 @@
+.idea/
+__pycache__/
+*.py[cod]
+
+# Local experiment corpus; its external location and content digest are recorded
+# by the V4 launcher, but the corpus itself must not be committed to this repo.
+deepseek_easy_ep_inputs/
