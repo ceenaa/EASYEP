@@ -106,6 +106,10 @@ class Profiler:
         self.tokens_seen = 0
         # --- norm-recovery validation (only populated in validate mode) ---
         self.validate = False
+        # bisect switches: each adds one observation on top of the previous
+        self.do_norms = True       # per-expert unweighted-norm recovery + all_gather
+        self.do_accum = True       # index_add_ into the score tensors
+        self.do_mhc = True         # the mHC simibr, which touches hc_post inputs
         # mHC-aware simibr: measured after hc_post remixes the FFN output into the
         # hc_mult residual copies, i.e. where the contribution actually lands.
         self.score_mhc = torch.zeros_like(self.score)
@@ -179,7 +183,7 @@ def patch(official: Any, profiler: Profiler) -> None:
         # token id, and the MTP/DSpark stages sit past the end of the score tensor.
         # Profiling them would compute norms and all-gather for a result that is
         # never consumed, and leave the stashes unreleased.
-        prof = (profiler.enabled and not self.gate.hash
+        prof = (profiler.enabled and profiler.do_norms and not self.gate.hash
                 and self.layer_id < profiler.n_layers)
         if prof:
             norms_local = torch.zeros(
@@ -292,7 +296,7 @@ def patch(official: Any, profiler: Profiler) -> None:
                 and self.layer_id < profiler.n_layers):   # excludes the MTP/DSpark stages
             simibr_mhc = None
             y_r = getattr(self.ffn, "_ep_y_routed", None)
-            if y_r is not None:
+            if y_r is not None and profiler.do_mhc:
                 # hc_post(0, ...) is the residual carried with no FFN contribution;
                 # hc_post(y_routed, ...) adds only the routed experts. Comparing the
                 # two isolates the routed contribution in the space it lands in.
@@ -304,7 +308,8 @@ def patch(official: Any, profiler: Profiler) -> None:
                 simibr_mhc = (1.0 - F.cosine_similarity(
                     base_hc.flatten(2).float(), routed_hc.flatten(2).float(), dim=-1)
                 ).clamp_min(0.0).view(-1)
-            self.ffn.ep_accumulate(h.view(-1, h.size(-1)), simibr_mhc)
+            if profiler.do_accum and getattr(self.ffn, "_ep_norms", None) is not None:
+                self.ffn.ep_accumulate(h.view(-1, h.size(-1)), simibr_mhc)
         x = self.hc_post(x, residual, post, comb)
         return x
 
@@ -1030,12 +1035,24 @@ def cmd_parity(a) -> None:
     say(f"  patched, profiling OFF:            max_abs {c_off['max_abs']:.3e}  "
         f"argmax disagreements {c_off['argmax_disagreements']}")
 
-    prof.enabled = True
-    patched_on = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
-    prof.enabled = False
-    c_on = _cmp(base2, patched_on)
-    say(f"  patched, profiling ON:             max_abs {c_on['max_abs']:.3e}  "
-        f"argmax disagreements {c_on['argmax_disagreements']}")
+    # Bisect: enable one observation at a time so a perturbation is attributed to
+    # the exact step that causes it, rather than to "profiling" as a whole.
+    stages = [("enabled, no observations", False, False, False),
+              ("norms only              ", True, False, False),
+              ("norms + accumulate     ", True, True, False),
+              ("norms + accum + mHC    ", True, True, True)]
+    stage_reports = {}
+    c_on = None
+    for label, dn, da, dm in stages:
+        prof.enabled, prof.do_norms, prof.do_accum, prof.do_mhc = True, dn, da, dm
+        got = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
+        prof.enabled = False
+        c = _cmp(base2, got)
+        stage_reports[label.strip()] = c
+        say(f"  profiling: {label}      max_abs {c['max_abs']:.3e}  "
+            f"argmax disagreements {c['argmax_disagreements']}")
+        c_on = c
+    prof.do_norms = prof.do_accum = prof.do_mhc = True
 
     unpatch(official, originals)
     restored = _logits_for(model, tok, encode_messages, P, a.max_seq_len, dev)
@@ -1044,7 +1061,8 @@ def cmd_parity(a) -> None:
 
     tol = max(a.tol, floor["max_abs"] * a.floor_mult)
     report = {"noise_floor": floor, "patched_profiling_off": c_off,
-              "patched_profiling_on": c_on, "after_unpatch": c_res,
+              "patched_profiling_on": c_on, "bisect": stage_reports,
+              "after_unpatch": c_res,
               "tolerance_used": tol, "abs_tol": a.tol, "floor_multiplier": a.floor_mult}
     ok = True
     for name, c in (("profiling OFF", c_off), ("profiling ON", c_on),
