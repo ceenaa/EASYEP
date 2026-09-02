@@ -1061,12 +1061,36 @@ def load_calibration(path: Path) -> list[str]:
                     pass
         return out
     raw = path.read_text(encoding="utf-8")
+
+    def text_of(row, index):
+        """Never fall back to json.dumps(row).
+
+        That turned "this file is not calibration text" into "calibrate on a
+        JSON dump of the record", which profiles a distribution nobody chose and
+        looks like a successful run. The same fallback in the evaluation path
+        put reference answers into prompts; fail instead of guessing.
+        """
+        if isinstance(row, str):
+            return row
+        if isinstance(row, dict):
+            for field in ("text", "prompt", "content"):
+                value = row.get(field)
+                if isinstance(value, str) and value:
+                    return value
+            raise SystemExit(
+                f"{path}: calibration record {index} has no non-empty "
+                f"text/prompt/content field (keys: {sorted(row)[:8]}); refusing "
+                "to calibrate on a JSON dump of the record")
+        raise SystemExit(
+            f"{path}: calibration record {index} is {type(row).__name__}, "
+            "expected a string or an object")
+
     if path.suffix == ".jsonl":
         rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
-        return [r.get("text") or r.get("prompt") or r.get("content") or json.dumps(r) for r in rows]
+        return [text_of(r, i) for i, r in enumerate(rows)]
     data = json.loads(raw)
     if isinstance(data, list):
-        return [d if isinstance(d, str) else (d.get("text") or d.get("prompt") or json.dumps(d)) for d in data]
+        return [text_of(d, i) for i, d in enumerate(data)]
     raise SystemExit(f"unsupported calibration file: {path}")
 
 
@@ -1116,7 +1140,10 @@ def cmd_profile(a) -> None:
             [(f"sample-{i}", text) for i, text in enumerate(samples)], inputs, cal,
             seed=a.seed, temperature=args.temperature,
             max_seq_len=a.max_seq_len, max_new_tokens=a.max_new_tokens,
-            max_chunks=a.max_chunks)
+            max_chunks=a.max_chunks,
+            # synthetic sample-N names, and raw text rather than the
+            # security-review prompt the evaluation uses
+            source_kind="sample_texts", security_prompt=False)
         torch.save(st, out)
         print(f"[easyep] wrote {out}  ({len(samples)} sources / {len(inputs)} chunks)",
               flush=True)
@@ -1135,8 +1162,7 @@ def cmd_mask(a) -> None:
     keep_n = a.keep
     _validate_keep(keep_n, n_experts, st.get("gate_topk"))
     _validate_score_state_observations(st, a.n_hash_layers, key)
-    mask = build_mask_from_scores(scores, keep_n, a.n_hash_layers)
-    mask["score_key"] = key
+    mask = build_mask_from_scores(scores, keep_n, a.n_hash_layers, score_key=key)
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(mask, indent=1), encoding="utf-8")
@@ -1427,10 +1453,22 @@ def _ids_sha256(ids: list[int]) -> str:
 def _calibration_provenance(files: list[tuple[str, str]], inputs: list[dict],
                             result: dict, *, seed: int, temperature: float,
                             max_seq_len: int, max_new_tokens: int,
-                            max_chunks: int) -> dict:
-    """Content-bind a reusable score tensor to its calibration trajectory."""
+                            max_chunks: int, source_kind: str,
+                            security_prompt: bool) -> dict:
+    """Content-bind a reusable score tensor to its calibration trajectory.
+
+    source_kind and security_prompt describe the calibration *distribution*.
+    The per-chunk token hashes already bind it, but nothing downstream can
+    interpret a hash: two artifacts profiled on different prompt distributions,
+    or on samples that have no corpus paths at all, were indistinguishable.
+    Consumers that depend on either property now check it explicitly.
+    """
+    if source_kind not in ("corpus_files", "sample_texts"):
+        raise ValueError(f"unknown calibration source_kind: {source_kind!r}")
     record = {
         "provenance_schema_version": 1,
+        "source_kind": source_kind,
+        "security_prompt": bool(security_prompt),
         "source_samples": len(files),
         "chunks": len(inputs),
         "forwards": int(result["forwards"]),
@@ -1466,6 +1504,14 @@ def _validate_calibration_provenance(record: Any, source: str = "score artifact"
     sha = re.compile(r"^[0-9a-f]{64}$")
     if not isinstance(record, dict) or record.get("provenance_schema_version") != 1:
         raise SystemExit(f"{source} is missing calibration provenance; re-profile it")
+    if record.get("source_kind") not in ("corpus_files", "sample_texts"):
+        raise SystemExit(
+            f"{source} does not record which calibration distribution produced it; "
+            "re-profile with this easyep_v4.py")
+    if not isinstance(record.get("security_prompt"), bool):
+        raise SystemExit(
+            f"{source} does not record whether calibration used the security-review "
+            "prompt; re-profile with this easyep_v4.py")
     integer_fields = ("source_samples", "chunks", "forwards", "response_tokens")
     if any(isinstance(record.get(key), bool) or not isinstance(record.get(key), int)
            or record[key] < 1 for key in integer_fields):
@@ -2017,8 +2063,24 @@ def cmd_pairs(a) -> None:
         return True
 
     selection = {}
+    # The disjointness guarantee is only as good as these paths. A sample_texts
+    # artifact records synthetic sample-N names that match nothing in the corpus,
+    # so the exclusion would silently no-op and the eval could reuse a profiled
+    # program while reporting zero overlap.
+    calibration = st["calibration"]
+    if calibration.get("source_kind") != "corpus_files":
+        raise SystemExit(
+            f"{a.scores_in} was profiled from "
+            f"{calibration.get('source_kind')!r}, whose sources have no corpus "
+            "paths; matched-pair selection could not exclude the profiled files. "
+            "Profile with `pipeline --calib-dir` before running pairs.")
+    if calibration.get("security_prompt") is not True:
+        raise SystemExit(
+            f"{a.scores_in} was profiled without the security-review prompt, so "
+            "its routing statistics are from a different distribution than this "
+            "evaluation. Re-profile with `pipeline --calib-dir`.")
     calibration_paths = {
-        str(item["path"]) for item in st["calibration"]["selected_sources"]
+        str(item["path"]) for item in calibration["selected_sources"]
     }
     pairs = load_pairs(
         Path(a.pairs_manifest), Path(a.calib_dir), a.n_pairs, a.seed,
@@ -2183,8 +2245,15 @@ def cmd_blind(a) -> None:
         raise SystemExit(f"no {pattern} under {src}")
 
     rng = random.Random(a.seed)
+    # The label assignment is the thing blinding exists to hide, so it must not
+    # be derivable. random.Random(a.seed) made it a pure function of a default
+    # seed and the published variant list -- three lines of public information
+    # reproduced the whole mapping, and the sealed key was decorative. a.seed
+    # still orders the items, which reveals nothing on its own.
     labels = [chr(ord("A") + i) for i in range(len(variants))]
-    rng.shuffle(labels)
+    if len(variants) > 26:
+        raise SystemExit("blinding supports at most 26 variants")
+    secrets.SystemRandom().shuffle(labels)
     tag2label = dict(zip(sorted(variants), labels))
     uid_salt = secrets.token_bytes(32)
     item_plaintext: dict[str, str] = {}
@@ -2680,7 +2749,10 @@ def cmd_pipeline(a) -> None:
         state["calibration"] = _calibration_provenance(
             files, inputs, cal, seed=a.seed, temperature=args.temperature,
             max_seq_len=a.max_seq_len, max_new_tokens=a.max_new_tokens,
-            max_chunks=a.max_chunks)
+            max_chunks=a.max_chunks,
+            # real corpus-relative paths, profiled through the same
+            # security-review prompt the evaluation uses
+            source_kind="corpus_files", security_prompt=True)
         torch.save(state, out / "expert_scores.pt")
 
     # ---------------- phase 2: mask ----------------

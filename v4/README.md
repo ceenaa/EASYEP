@@ -314,6 +314,7 @@ Outputs are grouped under `$EASYEP_RESULTS_ROOT/run_RUN_ID/`:
 | `scores/mask_keep{KEEP}_no_simibr.json` | no-`simibr` mask from profiling |
 | `scores/mask_pruned_*.json` | every evaluated scored/control mask, including gating-score, frequency, and random |
 | `scores/score_comparison.json` | per-layer overlap and cutoff margins for primary and no-`simibr` rankings |
+| `scores/mask_*.json` | the mask actually used for each evaluated variant |
 | `questions/answers_*.jsonl` | question completions for every variant, including the exact prompt, snippet, references, decoding seed/settings, token counts, and prompt hashes |
 | `questions/mask_*.json` | masks rebuilt from the saved score artifact |
 | `questions/summary.json` | question-evaluation summary and decoding settings |
@@ -355,6 +356,12 @@ must be regenerated from a schema-v2 run.
 Matched-pair selection excludes every source file selected for calibration, so
 the discrimination evaluation cannot reuse a profiled program. The selected
 paths and their content/token identities are persisted in `pairs_used.json`.
+That exclusion is only as good as the paths the score artifact recorded, so the
+score schema also records *which* calibration distribution produced it
+(`source_kind`, `security_prompt`). `pairs` refuses an artifact profiled from
+sample texts, whose synthetic names match nothing in the corpus and would make
+the exclusion silently vacuous, or one profiled without the security-review
+prompt, whose routing statistics come from a different distribution.
 
 `score_comparison.json` shows where the primary and no-`simibr` rules disagree;
 running both measures whether the token-contribution term helps. The standalone
@@ -364,7 +371,7 @@ frequency, and random controls.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 52 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 55 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask
@@ -401,7 +408,11 @@ snippet or prompt, rather than emitting an answer that a reasoning judge cannot
 assess. The variant mapping is withheld
 in the mode-0600 `KEY_do_not_open_until_graded.json`. Public UIDs are keyed with
 a random HMAC salt stored only in that withheld file, so the published variant
-names cannot be brute-forced from a judging bundle.
+names cannot be brute-forced from a judging bundle. The label assignment itself
+is drawn from the system CSPRNG rather than a seeded shuffle: seeded, it was a
+pure function of the default `--seed` and the variant list published above, and
+the whole mapping could be reproduced in three lines without the key. `--seed`
+still orders the items, which reveals nothing on its own.
 
 The published `item` is likewise an opaque salted id, not the join key. For the
 matched pairs the plaintext key embeds the CodeQL label, so publishing it would

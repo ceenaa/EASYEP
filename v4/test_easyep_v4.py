@@ -99,6 +99,7 @@ def fixture_calibration_provenance():
     digest = "a" * 64
     return {
         "provenance_schema_version": 1,
+        "source_kind": "corpus_files", "security_prompt": True,
         "source_samples": 1, "chunks": 1, "forwards": 1, "response_tokens": 1,
         "parameters": {"seed": 965, "temperature": 1.0, "max_seq_len": 64,
                        "max_new_tokens": 8, "max_chunks": 0},
@@ -111,6 +112,64 @@ def fixture_calibration_provenance():
                                  "file_index": 0, "chunk_index": 0, "tokens": 1,
                                  "token_ids_sha256": digest}],
     }
+
+
+def t_calibration_loader_refuses_to_guess_at_text():
+    """A record with no text field must stop the run, not become a JSON dump."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        ok = root / "ok.json"
+        ok.write_text(json.dumps(["plain text", {"text": "from text"},
+                                  {"prompt": "from prompt"},
+                                  {"content": "from content"}]))
+        assert E.load_calibration(ok) == [
+            "plain text", "from text", "from prompt", "from content"]
+
+        # the real questions file shape: rich records, no text/prompt/content
+        leaky = root / "questions.json"
+        leaky.write_text(json.dumps([
+            {"id": "Q01", "snippet": "var x=1;", "vulnerability": "XSS",
+             "expected_reasoning": "attacker controls x"}]))
+        must_raise(SystemExit, lambda: E.load_calibration(leaky), "JSON dump")
+
+        lines = root / "rows.jsonl"
+        lines.write_text(json.dumps({"id": 1, "snippet": "x"}) + "\n")
+        must_raise(SystemExit, lambda: E.load_calibration(lines), "JSON dump")
+
+        empty = root / "empty.json"
+        empty.write_text(json.dumps([{"text": ""}]))
+        must_raise(SystemExit, lambda: E.load_calibration(empty), "no non-empty")
+
+
+def t_calibration_provenance_records_its_distribution():
+    """A score artifact must say which calibration distribution produced it.
+
+    cmd_pairs excludes profiled files from matched-pair selection using the
+    recorded source paths. An artifact profiled from sample texts records
+    synthetic sample-N names that match nothing, so the exclusion would no-op
+    and the run would report zero overlap while reusing a profiled program.
+    """
+    good = fixture_calibration_provenance()
+    E._validate_calibration_provenance(good)          # accepted
+
+    for field, bad_value in (("source_kind", "something_else"),
+                             ("security_prompt", "yes")):
+        broken = json.loads(json.dumps(good))
+        broken[field] = bad_value
+        must_raise(SystemExit,
+                   lambda b=broken: E._validate_calibration_provenance(b),
+                   "re-profile")
+        missing = json.loads(json.dumps(good))
+        del missing[field]
+        must_raise(SystemExit,
+                   lambda m=missing: E._validate_calibration_provenance(m),
+                   "re-profile")
+
+    # the builder refuses an unknown kind rather than recording it
+    must_raise(ValueError, lambda: E._calibration_provenance(
+        [], [], {"forwards": 0, "response_tokens": 0, "generated_responses": []},
+        seed=1, temperature=1.0, max_seq_len=64, max_new_tokens=8, max_chunks=0,
+        source_kind="guess", security_prompt=True), "source_kind")
 
 
 def t_pair_loading_excludes_calibration_inputs_and_path_escapes():
@@ -786,6 +845,44 @@ def t_blind_hides_variant_and_covers_all():
         systems = [i["system"] for i in items]
         transitions = sum(a != b for a, b in zip(systems, systems[1:]))
         assert transitions > 2, "records remained grouped by source variant"
+
+
+def t_blind_label_mapping_is_not_derivable_from_the_seed():
+    """The sealed mapping must not be a pure function of public information.
+
+    It was: random.Random(a.seed) with --seed defaulting to 7 and the launcher
+    never passing it, so shuffling ["A".."G"] and zipping against the published
+    variant list recovered the whole mapping without the key.
+    """
+    tags = ["full", "pruned_paper", "pruned_gating", "pruned_no_simibr",
+            "pruned_frequency", "pruned_random", "pruned_reduced_legacy"]
+    seen = set()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "res"
+        src.mkdir()
+        for tag in tags:
+            with (src / f"answers_{tag}.jsonl").open("w") as fp:
+                for qid in ("Q01", "Q02"):
+                    fp.write(json.dumps({
+                        "id": qid, "completion": "neutral", "variant": tag,
+                        "snippet": "var x = 1;", "prompt": f"review {qid}",
+                    }) + "\n")
+        for attempt in range(6):
+            out = Path(td) / f"judge{attempt}"
+
+            class A:
+                results, pairs, seed, questions = str(src), False, 7, ""
+            a = A(); a.out = str(out)
+            E.cmd_blind(a)
+            key = json.loads(
+                (out / "KEY_do_not_open_until_graded.json").read_text())
+            assert set(key["label_to_variant"].values()) == set(tags)
+            seen.add(tuple(sorted(key["label_to_variant"].items())))
+
+    # A seeded shuffle gives the same mapping every time; a random one does not.
+    assert len(seen) > 1, (
+        "the label mapping is identical across runs at a fixed seed, so it is "
+        "derivable from public information and the key file is decorative")
 
 
 def t_pair_blind_includes_exact_judge_input_and_rejects_incomplete_rows():
@@ -1609,7 +1706,8 @@ def t_calibration_provenance_binds_inputs_responses_and_parameters():
                                        "token_ids_sha256": E._ids_sha256([7, 8])}]}
     record = E._calibration_provenance(
         files, inputs, result, seed=965, temperature=0.6,
-        max_seq_len=64, max_new_tokens=8, max_chunks=0)
+        max_seq_len=64, max_new_tokens=8, max_chunks=0,
+        source_kind="corpus_files", security_prompt=True)
     E._validate_calibration_provenance(record)
     assert record["selected_sources"][0]["text_sha256"] == \
         hashlib.sha256(files[0][1].encode()).hexdigest()
