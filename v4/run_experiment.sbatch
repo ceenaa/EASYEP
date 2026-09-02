@@ -209,6 +209,38 @@ export PYTHON_MODULE=${PYTHON_MODULE:-python}
 export CUDA_MODULE=${CUDA_MODULE:-cuda/13.2}
 module load "$PYTHON_MODULE" "$CUDA_MODULE"
 
+# The pinned requirements are hashed into RUN_MANIFEST.json, which records what
+# the run *should* have used. Compare them against what is actually importable
+# so a divergence is visible in the log instead of only inferable afterwards.
+# Not fatal by default: site wheelhouse builds (e.g. 2.13.0+cc) are legitimate
+# and intended. Set STRICT_PINS=1 to require an exact match.
+STRICT_PINS=${STRICT_PINS:-0}
+if ! "$VENV/bin/python" - "$REPO/v4/requirements-v4.txt" "$STRICT_PINS" <<'PYPIN'; then
+import importlib.metadata as md, re, sys
+requirements, strict = sys.argv[1], sys.argv[2] == "1"
+diverged = []
+for line in open(requirements, encoding="utf-8"):
+    line = line.split("#", 1)[0].strip()
+    match = re.fullmatch(r"([A-Za-z0-9._-]+)==([^\s]+)", line)
+    if not match:
+        continue
+    name, pinned = match.group(1), match.group(2)
+    try:
+        installed = md.version(name)
+    except md.PackageNotFoundError:
+        installed = "MISSING"
+    if installed != pinned:
+        diverged.append((name, pinned, installed))
+        print(f"  PIN MISMATCH  {name}: pinned {pinned}, installed {installed}")
+if not diverged:
+    print("  all pins match the active environment")
+sys.exit(1 if (diverged and strict) else 0)
+PYPIN
+  echo "ABORT: STRICT_PINS=1 and the environment does not match v4/requirements-v4.txt." >&2
+  exit 2
+fi
+
+
 # The shell regex above rejects malformed values, but a syntactically valid
 # exponent such as 1e999 overflows Python's float to infinity.  Reject that
 # before writing non-standard JSON or starting a multi-GPU model process.
@@ -234,6 +266,10 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONHASHSEED=${PYTHONHASHSEED:-$SEED}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
+# The profiler enables strict deterministic algorithms around its score
+# reductions. CUDA >= 10.2 requires this workspace setting for cuBLAS to be
+# deterministic, and raises rather than silently degrading without it.
+export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 
 # Job-local caches avoid races between concurrent compilations. A persistent
 # cache can still be selected explicitly with EASYEP_CACHE_ROOT.
@@ -252,8 +288,42 @@ require_uint MASTER_PORT_BASE "$MASTER_PORT_BASE" 1024 65527
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 
 mkdir -p "$RESULTS_ROOT"
-if ! mkdir "$OUT"; then
-  echo "ABORT: output already exists or could not be created (choose a new RUN_ID): $OUT" >&2
+# RESUME=1 reattaches to an existing run directory and skips stages that already
+# recorded a completion sentinel. Without it the launcher still refuses to touch
+# an existing directory, so a resume is always a deliberate act.
+RESUME=${RESUME:-0}
+if [[ $RESUME == 1 && -d $OUT ]]; then
+  require_dir "$OUT/.stages"
+  require_file "$OUT/RUN_MANIFEST.json"
+  # Stages already on disk were produced under the earlier parameters. Resuming
+  # with different ones would silently splice incompatible halves together.
+  if ! "$VENV/bin/python" - "$OUT/RUN_MANIFEST.json" \
+      "$KEEP" "$N_CALIB" "$N_PAIRS" "$MAX_SEQ_LEN" "$MAX_NEW_TOKENS" \
+      "$PAIR_MAX_NEW_TOKENS" "$MAX_CHUNKS" "$SEED" "$TEMPERATURE" <<'PYRESUME'; then
+import json, sys
+manifest, argv = json.loads(open(sys.argv[1], encoding="utf-8").read()), sys.argv[2:]
+names = ("keep", "n_calib", "n_pairs", "max_seq_len", "max_new_tokens",
+         "pair_max_new_tokens", "max_chunks", "seed")
+previous = manifest.get("parameters", {})
+changed = []
+for name, value in zip(names, argv):
+    if previous.get(name) != int(value):
+        changed.append(f"{name}: was {previous.get(name)!r}, now {int(value)}")
+wanted = None if argv[8] == "" else float(argv[8])
+if previous.get("temperature") != wanted:
+    changed.append(f"temperature: was {previous.get('temperature')!r}, now {wanted!r}")
+for line in changed:
+    print(f"  RESUME MISMATCH  {line}")
+sys.exit(1 if changed else 0)
+PYRESUME
+    echo "ABORT: RESUME=1 but the parameters differ from the existing run." >&2
+    echo "       Use a new RUN_ID instead of splicing incompatible stages." >&2
+    exit 2
+  fi
+  echo "RESUME: reattaching to $OUT; completed stages will be skipped."
+elif ! mkdir "$OUT"; then
+  echo "ABORT: output already exists or could not be created (choose a new RUN_ID," \
+       "or resubmit the same RUN_ID with RESUME=1): $OUT" >&2
   exit 2
 fi
 
@@ -535,11 +605,23 @@ echo " out        $OUT"
 echo "================================================================"
 
 stage_index=0
+# A stage is complete only if it exited zero; the sentinel is written after the
+# subshell returns, so a killed or failed stage is always re-run.
+mkdir -p "$OUT/.stages"
+stage_done() { [[ -f "$OUT/.stages/$1.done" ]]; }
+mark_done() { : > "$OUT/.stages/$1.done"; }
+
 run_stage() {                  # run_stage <name> <mode> <args...>
   local stage=$1
   shift
   local port=$((MASTER_PORT_BASE + stage_index))
   stage_index=$((stage_index + 1))
+  if [[ $RESUME == 1 ]] && stage_done "$stage"; then
+    echo
+    echo "---------- stage: $stage  SKIPPED (already completed) ----------"
+    STAGES_COMPLETED+=("$stage")
+    return 0
+  fi
   echo
   echo "---------- stage: $stage (master $MASTER_ADDR:$port) ----------"
   preflight_integrity
@@ -549,6 +631,7 @@ run_stage() {                  # run_stage <name> <mode> <args...>
       --master-addr="$MASTER_ADDR" --master-port="$port" \
       "$SCRIPT" "$@"
   )
+  mark_done "$stage"
   STAGES_COMPLETED+=("$stage")
 }
 
@@ -589,11 +672,22 @@ run_stage pairs pairs "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --max-new-tokens "$PAIR_MAX_NEW_TOKENS"
 
 preflight_integrity
-"$VENV/bin/python" "$SCRIPT" blind --results "$OUT/questions" \
-  --questions "$DATA_ROOT/questions_used.json" --out "$OUT/judge/questions"
+# cmd_blind refuses to overwrite, so a resumed run must skip an completed bundle.
+if [[ $RESUME == 1 ]] && stage_done blind_questions; then
+  echo "---------- stage: blind_questions  SKIPPED (already completed) ----------"
+else
+  "$VENV/bin/python" "$SCRIPT" blind --results "$OUT/questions" \
+    --questions "$DATA_ROOT/questions_used.json" --out "$OUT/judge/questions"
+  mark_done blind_questions
+fi
 STAGES_COMPLETED+=(blind_questions)
-"$VENV/bin/python" "$SCRIPT" blind --results "$OUT/pairs" --pairs \
-  --out "$OUT/judge/pairs"
+if [[ $RESUME == 1 ]] && stage_done blind_pairs; then
+  echo "---------- stage: blind_pairs  SKIPPED (already completed) ----------"
+else
+  "$VENV/bin/python" "$SCRIPT" blind --results "$OUT/pairs" --pairs \
+    --out "$OUT/judge/pairs"
+  mark_done blind_pairs
+fi
 STAGES_COMPLETED+=(blind_pairs)
 
 echo

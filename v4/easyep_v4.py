@@ -81,7 +81,12 @@ def deterministic_score_reductions():
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     torch.use_deterministic_algorithms(True, warn_only=False)
     try:
-        yield
+        # Yield what actually took effect rather than what was requested. The
+        # pinned torch is not the torch these runs execute on, so a build that
+        # ignores or downgrades the request must not leave the artifact
+        # claiming a determinism guarantee that never held.
+        yield (torch.are_deterministic_algorithms_enabled()
+               and not torch.is_deterministic_algorithms_warn_only_enabled())
     finally:
         torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
 
@@ -141,6 +146,9 @@ class Profiler:
         self.counts = torch.zeros((n_layers, n_experts), dtype=torch.int64, device=device)
         self.gate_sums = torch.zeros_like(self.score)
         self.tokens_seen = 0
+        # None until the first accumulation; AND-reduced thereafter, so one
+        # non-deterministic reduction anywhere is enough to withdraw the claim.
+        self.deterministic_reductions = None
         # --- norm-recovery validation (only populated in validate mode) ---
         self.validate = False
         # bisect switches: each adds one observation on top of the previous
@@ -153,6 +161,12 @@ class Profiler:
         # later layers from the reported error distribution.
         self._err = [[] for _ in range(n_layers)]         # samples, grouped by layer
         self._err_n_by_layer = [0] * n_layers
+
+    def note_reduction_determinism(self, observed: bool) -> None:
+        """Record whether strict deterministic kernels were genuinely active."""
+        self.deterministic_reductions = (
+            bool(observed) if self.deterministic_reductions is None
+            else self.deterministic_reductions and bool(observed))
 
     def err_tensor(self):
         chunks = [chunk for layer_chunks in self._err for chunk in layer_chunks]
@@ -182,7 +196,8 @@ class Profiler:
             "n_experts": self.n_experts,
             "gate_topk": self.gate_topk,
             "accumulation_mode": ACCUMULATION_MODE,
-            "deterministic_score_reductions": True,
+            "deterministic_score_reductions": self.deterministic_reductions is True,
+            "torch_version": torch.__version__,
             "norm_error_samples_per_layer": list(self._err_n_by_layer),
         }
         if (n_hash_layers is None) != (model_identity is None):
@@ -392,7 +407,8 @@ def patch(official: Any, profiler: Profiler) -> None:
         # 2.10 provides a deterministic CUDA path when strict deterministic
         # algorithms are enabled; scope it to these mutations so custom model
         # kernels outside the profiler are unaffected.
-        with deterministic_score_reductions():
+        with deterministic_score_reductions() as deterministic_reduction:
+            profiler.note_reduction_determinism(deterministic_reduction)
             for slot in range(idx.size(1)):
                 e = idx[:, slot]
                 profiler.score[lid].index_add_(
@@ -815,11 +831,20 @@ def _require_score_artifact(state: dict, source: str = "score artifact",
         raise SystemExit(
             f"{source} uses incompatible score schema {version!r}/{semantics!r}; "
             "re-profile with this easyep_v4.py before building or evaluating masks")
-    if (state.get("accumulation_mode") != ACCUMULATION_MODE
-            or state.get("deterministic_score_reductions") is not True):
+    if state.get("accumulation_mode") != ACCUMULATION_MODE:
         raise SystemExit(
-            f"{source} does not attest deterministic score accumulation; "
-            "re-profile with this easyep_v4.py before building or evaluating masks")
+            f"{source} was accumulated as {state.get('accumulation_mode')!r}, not "
+            f"{ACCUMULATION_MODE!r}; re-profile with this easyep_v4.py before "
+            "building or evaluating masks")
+    if state.get("deterministic_score_reductions") is not True:
+        # Not a stale-artifact check: this fires when the run itself observed
+        # that strict deterministic kernels were not actually in force, so the
+        # expert ranking is not reproducible and must not be used.
+        raise SystemExit(
+            f"{source} reports that deterministic score reductions did not hold "
+            f"(torch {state.get('torch_version', 'unknown')}); the expert ranking "
+            "is not reproducible. Re-profile on a build whose index_add_ honours "
+            "torch.use_deterministic_algorithms(True).")
     for key in ("score", "score_mhc", "score_reduced_legacy",
                 "score_no_simibr", "counts", "gate_sums"):
         if key not in state:
@@ -1161,7 +1186,7 @@ def cmd_eval(a) -> None:
         t0 = time.time()
         with torch.inference_mode():
             out = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
-        completion = tok.decode(out[0])
+        completion, _n_completion = _decode_completion(tok, out, ids)
         if rank == 0:
             fp.write(json.dumps({
                 "variant": tag,
@@ -1223,40 +1248,6 @@ Remediation: concrete fix
 """
 
 
-def chunk_code(code: str, max_chars: int, max_chunks: int) -> list[str]:
-    """Split a source file into line-aligned chunks that each fit the context.
-
-    Truncating to the first N tokens silently drops everything after it -- and a
-    sink often sits far below its source, so the routing behaviour that matters
-    is exactly what gets cut. Measured on this corpus: 17% of files exceed a
-    4096-token prompt, and one 9,962-token file alone accounted for 19% of the
-    calibration tokens in a 25-file sample.
-    """
-    if max_chars < 1:
-        raise ValueError("max_chars must be positive")
-    if max_chunks < 0:
-        raise ValueError("max_chunks must be non-negative (0 means unlimited)")
-    if len(code) <= max_chars:
-        return [code]
-    chunks, cur, size = [], [], 0
-    for line in code.splitlines(keepends=True):
-        # a single pathological line longer than the budget: hard-split it
-        while len(line) > max_chars:
-            if cur:
-                chunks.append("".join(cur)); cur, size = [], 0
-            chunks.append(line[:max_chars]); line = line[max_chars:]
-        if size + len(line) > max_chars and cur:
-            chunks.append("".join(cur)); cur, size = [], 0
-        cur.append(line); size += len(line)
-    if cur:
-        chunks.append("".join(cur))
-    if max_chunks and len(chunks) > max_chunks:
-        raise ValueError(
-            f"source requires {len(chunks)} calibration chunks, exceeding explicit "
-            f"--max-chunks={max_chunks}; increase the cap or use 0 for unlimited")
-    return chunks
-
-
 def sample_calibration_files(root: Path, n: int, seed: int = 42) -> list[tuple[str, str]]:
     """Stratified sample across CWE directories, so no single class dominates."""
     import random
@@ -1294,7 +1285,15 @@ def _calibration_chunks(files: list[tuple[str, str]], tok, encode_messages,
                         max_seq_len: int, max_new_tokens: int,
                         max_chunks: int, *, security_prompt: bool = True,
                         min_prompt_tokens: int = 32) -> list[dict]:
-    """Create shared, token-exact calibration inputs without dropping source tails."""
+    """Create shared, token-exact calibration inputs without dropping source tails.
+
+    Truncating to the first N tokens silently drops everything after it -- and a
+    sink often sits far below its source, so the routing behaviour that matters
+    is exactly what gets cut. Measured on this corpus: 17% of files exceed a
+    4096-token prompt, and one 9,962-token file alone accounted for 19% of the
+    calibration tokens in a 25-file sample. Splitting is exact, so concatenating
+    the pieces reproduces every source character.
+    """
     input_limit = max_seq_len - max_new_tokens
     if max_new_tokens < 1 or input_limit < min_prompt_tokens:
         raise ValueError(
@@ -1349,7 +1348,7 @@ def _calibration_chunks(files: list[tuple[str, str]], tok, encode_messages,
 def _completion_token_ids(generated, prompt_ids: list[int]) -> list[int]:
     """Normalise generate() output and tolerate APIs returning prompt+completion."""
     if generated is None or len(generated) != 1:
-        raise RuntimeError("calibration generation must return exactly one sequence")
+        raise RuntimeError("generation must return exactly one sequence")
     seq = generated[0]
     if isinstance(seq, torch.Tensor):
         seq = seq.detach().cpu().tolist()
@@ -1357,6 +1356,19 @@ def _completion_token_ids(generated, prompt_ids: list[int]) -> list[int]:
     if len(seq) >= len(prompt_ids) and seq[:len(prompt_ids)] == prompt_ids:
         seq = seq[len(prompt_ids):]
     return seq
+
+
+def _decode_completion(tok, generated, prompt_ids: list[int]) -> tuple[str, int]:
+    """Decode only the generated continuation, never the prompt.
+
+    Every generate() consumer must agree on the API's contract. The pinned
+    generator returns prompt+completion, so decoding element 0 whole would store
+    the prompt -- including the answer scaffolding -- as the model's answer.
+    _completion_token_ids strips it when present and is a no-op otherwise, so
+    this stays correct under either convention.
+    """
+    ids = _completion_token_ids(generated, prompt_ids)
+    return tok.decode(ids), len(ids)
 
 
 def _run_calibration(model, inputs: list[dict], generate, eos_token_id: int,
@@ -2099,7 +2111,7 @@ def cmd_pairs(a) -> None:
             t1 = time.time()
             with torch.inference_mode():
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
-            completion = tok.decode(gen[0])
+            completion, n_completion = _decode_completion(tok, gen, ids)
             if rank == 0:
                 rows.append({"pair_id": pid, "truth": item["truth"],
                              "path": item["path"],
@@ -2113,7 +2125,7 @@ def cmd_pairs(a) -> None:
                              "seed": a.seed + pid,
                              "temperature": args.temperature,
                              "prompt_tokens": len(ids),
-                             "completion_tokens": len(gen[0]),
+                             "completion_tokens": n_completion,
                              "seconds": round(time.time() - t1, 2)})
                 if (i + 1) % 10 == 0:
                     say(f"  {tag} {i+1}/{len(items)}")
@@ -2193,6 +2205,8 @@ def cmd_blind(a) -> None:
     rng.shuffle(labels)
     tag2label = dict(zip(sorted(variants), labels))
     uid_salt = secrets.token_bytes(32)
+    item_plaintext: dict[str, str] = {}
+    item_truth: dict[str, str] = {}
 
     items = []
     for r in records:
@@ -2243,11 +2257,18 @@ def cmd_blind(a) -> None:
                     "expected_reasoning": reference_source.get("expected_reasoning"),
                 }
             }
+        # item_key embeds the matched-pair ground truth, so publish only an
+        # opaque, salted form of it: graders still group the same item across
+        # systems, but cannot read the answer off the bundle. The plaintext
+        # mapping lives in the withheld key alongside the variant labels.
+        item_id = hmac.new(uid_salt, ("item\0" + item_key).encode(),
+                           hashlib.sha256).hexdigest()[:16]
+        item_plaintext[item_id] = item_key
         items.append({
             "uid": hmac.new(
                 uid_salt, (item_key + "\0" + r["_variant"]).encode(),
                 hashlib.sha256).hexdigest()[:16],
-            "item": item_key,
+            "item": item_id,
             "system": tag2label[r["_variant"]],
             "completion": r["completion"],
             # what was asked, so the answer can actually be graded
@@ -2255,9 +2276,13 @@ def cmd_blind(a) -> None:
             # reference answer, withheld from a blind-quality pass but needed for
             # a correctness pass -- keep it in a separate field the grader can drop
             **reference,
-            **({"truth": r["truth"], "path": r.get("path")} if "truth" in r else {}),
+            # ``truth`` is the CodeQL label being tested; it is withheld with the
+            # key. ``path`` is already the label-neutral display path.
+            **({"path": r.get("path")} if "truth" in r else {}),
             **({"cwe": r.get("cwe")} if "cwe" in r and not q else {}),
         })
+        if "truth" in r:
+            item_truth[item_id] = r["truth"]
     rng.shuffle(items)
 
     (out / "to_judge.jsonl").write_text(
@@ -2266,6 +2291,8 @@ def cmd_blind(a) -> None:
     key_payload = json.dumps({
         "label_to_variant": {v: k for k, v in tag2label.items()},
         "uid_hmac_salt_hex": uid_salt.hex(),
+        "item_to_plaintext": item_plaintext,
+        "item_to_truth": item_truth,
         "n_items": len(items), "seed": a.seed,
     }, indent=1)
     fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2764,7 +2791,7 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
             t1 = time.time()
             with torch.inference_mode():
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
-            completion = tok.decode(gen[0])
+            completion, n_completion = _decode_completion(tok, gen, ids)
             if rank == 0:
                 rows.append({
                     "id": q.get("id"),
@@ -2780,7 +2807,7 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                     "seed": a.seed + i,
                     "temperature": args.temperature,
                     "prompt_tokens": len(ids),
-                    "completion_tokens": len(gen[0]),
+                    "completion_tokens": n_completion,
                     "seconds": round(time.time() - t1, 2),
                 })
                 say(f"  {tag} {i+1}/{len(questions)}  {time.time()-t1:.1f}s")

@@ -276,11 +276,17 @@ The main environment overrides are:
 | `SEED` | `965` | calibration ordering, controls, and paired decoding seed |
 | `TEMPERATURE` | unset | keep the model default (`1.0`); set `0` for greedy decoding |
 | `RUN_ID` | Slurm job id | suffix of the unique output directory |
+| `RESUME` | `0` | `1` reattaches to an existing `run_RUN_ID` and skips stages that completed, after checking the parameters still match |
+| `STRICT_PINS` | `0` | `1` aborts when the active environment does not match `requirements-v4.txt` exactly; otherwise divergences are logged |
 | `MASTER_PORT_BASE` | job-derived | first of the per-stage rendezvous ports |
 | `PYTHON_MODULE` | `python` | module used to create and run the V4 virtual environment |
 | `CUDA_MODULE` | `cuda/13.2` | CUDA module loaded in the job |
 
-The launcher refuses to overwrite an existing `run_RUN_ID` directory and, for a
+A stage that exits zero records a sentinel under `run_RUN_ID/.stages/`, so a job
+lost to the walltime can be resubmitted with the same `RUN_ID` and `RESUME=1`
+to continue from the last completed stage rather than re-profiling. Resuming
+aborts if the run parameters changed. Without `RESUME=1` the launcher refuses
+to overwrite an existing `run_RUN_ID` directory and, for a
 Git checkout, refuses tracked or staged changes. Its compact `RUN_MANIFEST.json`
 content-hashes the executing EASY-EP files, official inference/encoding trees,
 configuration, tokenizers, questions, pair manifest, and complete input data
@@ -389,8 +395,14 @@ snippet or prompt, rather than emitting an answer that a reasoning judge cannot
 assess. The variant mapping is withheld
 in the mode-0600 `KEY_do_not_open_until_graded.json`. Public UIDs are keyed with
 a random HMAC salt stored only in that withheld file, so the published variant
-names cannot be brute-forced from a judging bundle. Grade it with whatever judge
-you like, then join on `uid` and open the key.
+names cannot be brute-forced from a judging bundle.
+
+The published `item` is likewise an opaque salted id, not the join key. For the
+matched pairs the plaintext key embeds the CodeQL label, so publishing it would
+hand the grader the answer; `item_to_plaintext` and `item_to_truth` live in the
+withheld key instead. Grading still groups systems per item, because the same
+item yields the same opaque id across variants. Grade it with whatever judge you
+like, then join on `uid` and open the key.
 
 The one result that is still computed, because it needs no judge: the matched-pair
 eval parses the `Verdict:` line and scores it against CodeQL ground truth. The

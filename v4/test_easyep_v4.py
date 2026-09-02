@@ -743,9 +743,15 @@ def t_blind_hides_variant_and_covers_all():
             assert f'"{tag}"' not in blob, f"variant name {tag} leaked into the judging file"
         assert set(i["system"] for i in items) == {"A", "B", "C"}
         assert len({i["uid"] for i in items}) == 12, "uids must be unique"
+        key = json.loads((out / "KEY_do_not_open_until_graded.json").read_text())
+        # the published item id is opaque; the plaintext join key is withheld
+        plain = key["item_to_plaintext"]
+        assert set(plain) == {i["item"] for i in items}
+        for it in items:
+            assert plain[it["item"]] not in blob, "plaintext item key leaked"
         # the join must supply the question and a reference for every item
         for it in items:
-            qid = it["item"].split("|", 1)[0]
+            qid = plain[it["item"]].split("|", 1)[0]
             i = question_ids.index(0 if qid == "0" else qid)
             assert it["snippet"] == f"var x={i};", f"wrong question joined for {qid}"
             expected_prompt = E.question_text({
@@ -762,18 +768,17 @@ def t_blind_hides_variant_and_covers_all():
                 "expected_reasoning": f"because-{i}",
             }
             assert "variant" not in it and "internal_tag" not in it and "_variant" not in it
-        key = json.loads((out / "KEY_do_not_open_until_graded.json").read_text())
         assert set(key["label_to_variant"].values()) == set(tags)
         assert len(key["uid_hmac_salt_hex"]) == 64
         salt = bytes.fromhex(key["uid_hmac_salt_hex"])
         for item in items:
             variant = key["label_to_variant"][item["system"]]
             expected_uid = hmac.new(
-                salt, (item["item"] + "\0" + variant).encode(),
+                salt, (plain[item["item"]] + "\0" + variant).encode(),
                 hashlib.sha256).hexdigest()[:16]
             assert item["uid"] == expected_uid
             assert item["uid"] != hashlib.sha1(
-                (item["item"] + variant).encode()).hexdigest()[:12]
+                (plain[item["item"]] + variant).encode()).hexdigest()[:12]
         assert ((out / "KEY_do_not_open_until_graded.json").stat().st_mode & 0o777) == 0o600
         # each system must answer every item exactly once
         from collections import Counter
@@ -819,7 +824,15 @@ def t_pair_blind_includes_exact_judge_input_and_rejects_incomplete_rows():
             assert item["source_sha256"] == source_sha256
             assert item["prompt_sha256"] == prompt_sha256
             assert item["prompt_ids_sha256"] == prompt_ids_sha256
-            assert item["truth"] == "VULNERABLE"
+            # the CodeQL label is the thing under test: it must not ship with
+            # the bundle, or a grader reads the answer off the record
+            assert "truth" not in item, "ground truth leaked into the judging bundle"
+
+        key = json.loads((out / "KEY_do_not_open_until_graded.json").read_text())
+        assert set(key["item_to_truth"].values()) == {"VULNERABLE"}
+        assert set(key["item_to_truth"]) == {i["item"] for i in items}
+        assert "VULNERABLE" not in (out / "to_judge.jsonl").read_text().replace(
+            "Verdict: VULNERABLE", ""), "truth leaked in some other field"
 
         broken = json.loads((src / "pairs_full.jsonl").read_text())
         del broken["snippet"]
@@ -1180,7 +1193,14 @@ def t_profiler_shapes_and_dtypes():
               "deterministic_score_reductions", "norm_error_samples_per_layer"):
         assert k in st, f"state() is missing {k}"
     assert st["accumulation_mode"] == E.ACCUMULATION_MODE
-    assert st["deterministic_score_reductions"] is True
+    # The attestation is an observation, not a constant: a profiler that never
+    # accumulated has observed nothing and must not claim the guarantee.
+    assert st["deterministic_score_reductions"] is False
+    p.note_reduction_determinism(True)
+    assert p.state()["deterministic_score_reductions"] is True
+    # one non-deterministic reduction withdraws the claim for the whole run
+    p.note_reduction_determinism(False)
+    assert p.state()["deterministic_score_reductions"] is False
     assert st["norm_error_samples_per_layer"] == [0] * N_L
 
 
@@ -1206,6 +1226,7 @@ def t_score_artifact_schema_rejects_stale_or_incomplete_scores():
     profiler = E.Profiler(4, 8, torch.device("cpu"))
     profiler.gate_topk = 2
     profiler.tokens_seen = 1
+    profiler.note_reduction_determinism(True)   # as a real accumulation would
     state = profiler.state(1, identity)
     state["calibration"] = fixture_calibration_provenance()
     assert E._require_score_artifact(
@@ -1217,6 +1238,14 @@ def t_score_artifact_schema_rejects_stale_or_incomplete_scores():
     must_raise(SystemExit, lambda: E._require_score_artifact(wrong, "fixture"), "re-profile")
     missing = dict(state); del missing["counts"]
     must_raise(SystemExit, lambda: E._require_score_artifact(missing, "fixture"), "missing")
+    # an artifact whose reductions were observed non-deterministic is rejected,
+    # not silently ranked
+    withdrawn = dict(state); withdrawn["deterministic_score_reductions"] = False
+    must_raise(
+        SystemExit,
+        lambda: E._require_score_artifact(withdrawn, "fixture"),
+        "deterministic")
+
     nondeterministic = dict(state); del nondeterministic["accumulation_mode"]
     must_raise(
         SystemExit,
@@ -1228,7 +1257,9 @@ def t_score_artifact_schema_rejects_stale_or_incomplete_scores():
         lambda: E._require_score_artifact(state, "fixture", n_hash_layers=2),
         "n_hash_layers",
     )
-    no_provenance = E.Profiler(4, 8, torch.device("cpu")).state()
+    bare = E.Profiler(4, 8, torch.device("cpu"))
+    bare.note_reduction_determinism(True)   # isolate the provenance failure
+    no_provenance = bare.state()
     must_raise(
         SystemExit, lambda: E._require_score_artifact(no_provenance, "fixture"),
         "provenance",
@@ -1321,23 +1352,51 @@ def t_model_identity_hashes_sources_tokenizer_shard_and_optional_attestation():
         assert record["content_identity_sha256"] == provenance["content_identity_sha256"]
 
 
-def t_chunking_covers_the_whole_file():
-    """Truncation drops late sinks; chunking must not."""
+def t_calibration_chunking_covers_the_whole_file():
+    """Truncation drops late sinks; token-exact chunking must not.
+
+    Exercises the path the profiler actually runs (_calibration_chunks ->
+    split_to_fit), measured in tokens, not a char-budget helper.
+    """
     body = "".join(f"line {i} some code here\n" for i in range(400))
-    ch = E.chunk_code(body, 500, 0)  # zero means unlimited
-    assert len(ch) > 1, "long file was not chunked"
-    assert "".join(ch) == body, "chunking lost or reordered content"
-    assert all(len(c) <= 500 for c in ch), "a chunk exceeded the budget"
-    assert all(c.endswith("\n") for c in ch[:-1]), "chunks must be line-aligned"
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def encode(self, prompt):
+            return [ord(c) for c in prompt]
+
+    def encode_messages(messages, thinking_mode):
+        assert messages and thinking_mode == "chat"
+        return messages[0]["content"]
+
+    def pieces_of(inputs):
+        """Recover each chunk's source text from its prompt tokens."""
+        out = []
+        for item in inputs:
+            prompt = "".join(chr(i) for i in item["prompt_ids"])
+            opener = "<UNTRUSTED_CODE>\n"
+            begin = prompt.index(opener) + len(opener)
+            out.append(prompt[begin:prompt.rindex("\n</UNTRUSTED_CODE>")])
+        return out
+
+    def chunk(code, **kw):
+        return E._calibration_chunks(
+            [("CWE-1/a.js", code)], Tokenizer(), encode_messages,
+            max_seq_len=1000, max_new_tokens=8, **kw)
+
+    inputs = chunk(body, max_chunks=0)  # zero means unlimited
+    assert len(inputs) > 1, "long file was not chunked"
+    assert all(len(i["prompt_ids"]) <= 1000 - 8 for i in inputs), "chunk exceeded budget"
+    assert "".join(pieces_of(inputs)) == body, "chunking lost or reordered content"
+    assert all(i["n_chunks"] == len(inputs) for i in inputs), "n_chunks disagrees"
+    assert [i["chunk_index"] for i in inputs] == list(range(len(inputs)))
+
     # short files pass through untouched
-    assert E.chunk_code("short\n", 500, 0) == ["short\n"]
+    assert pieces_of(chunk("short enough to fit\n", max_chunks=0)) == ["short enough to fit\n"]
+
     # An explicit cap must reject overflow instead of silently dropping the tail.
-    must_raise(ValueError, lambda: E.chunk_code(body, 100, 3), "chunk")
-    # a single line longer than the budget is hard-split, not dropped
-    one = "x" * 1200 + "\n"
-    hard = E.chunk_code(one, 500, 0)
-    assert "".join(hard) == one, "oversized line lost content"
-    assert all(len(c) <= 500 for c in hard)
+    must_raise(ValueError, lambda: chunk(body, max_chunks=2), "chunk")
 
 
 def t_calibration_sampling_is_stratified_and_stable():
