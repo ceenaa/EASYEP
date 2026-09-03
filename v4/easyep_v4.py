@@ -76,7 +76,9 @@ MAX_SUPPORTED_SEQ_LEN = 24576
 # goes through one mode. Scattered literals drift, and a mismatch between the
 # profiled and evaluated distributions is invisible in the numbers, so there is
 # exactly one definition and it is recorded in the score artifact.
-THINKING_MODE = "reasoning"
+# encoding_dsv4.render_message asserts thinking_mode in ["chat", "thinking"],
+# so "reasoning" is not a valid value -- it fails on the first encode.
+THINKING_MODE = "thinking"
 
 
 @contextmanager
@@ -1359,7 +1361,13 @@ def _calibration_chunks(files: list[tuple[str, str]], tok, encode_messages,
 
 
 def _completion_token_ids(generated, prompt_ids: list[int]) -> list[int]:
-    """Normalise generate() output and tolerate APIs returning prompt+completion."""
+    """Normalise generate() output and tolerate APIs returning prompt+completion.
+
+    The pinned generator returns completion tokens only -- it slices
+    toks[prompt_len:prompt_len+max_new_tokens] before returning -- so this strip
+    is a no-op against it. It stays because every consumer must agree on the
+    contract, and being right under both shapes costs nothing.
+    """
     if generated is None or len(generated) != 1:
         raise RuntimeError("generation must return exactly one sequence")
     seq = generated[0]

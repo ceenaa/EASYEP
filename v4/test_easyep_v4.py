@@ -220,7 +220,10 @@ def t_every_prompt_uses_one_thinking_mode():
     show up as an error, only as scores that quietly describe a different
     workload, so there is one constant and no literals.
     """
-    assert E.THINKING_MODE == "reasoning"
+    # encoding_dsv4 asserts thinking_mode in ["chat", "thinking"]; anything else
+    # fails on the first encode_messages call, before a single token is decoded.
+    assert E.THINKING_MODE in ("chat", "thinking")
+    assert E.THINKING_MODE == "thinking", "the run must exercise the reasoning path"
     source = inspect.getsource(E)
     assert 'thinking_mode="chat"' not in source, "a literal thinking mode came back"
     assert "thinking_mode=THINKING_MODE" in source
@@ -1772,7 +1775,11 @@ def t_calibration_profiles_prompt_and_generated_response_once():
     def generate(_model, prompts, max_new_tokens, eos_token_id):
         assert profiler.enabled is False
         assert max_new_tokens == 8 and eos_token_id == 0
-        return [prompts[0] + [50, 51, 52]]  # prompt-inclusive API form
+        # Verified against the pinned source: generate() returns completion
+        # tokens only (it slices toks[prompt_len:prompt_len+max_new_tokens]), so
+        # the strip is a no-op there. This mock returns the prompt-inclusive
+        # shape on purpose, to prove the strip still holds if that ever changes.
+        return [prompts[0] + [50, 51, 52]]
 
     result = E._run_calibration(
         Model(), inputs, generate, 0, profiler, 64, 8, 123,
