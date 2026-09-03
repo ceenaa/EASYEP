@@ -2391,13 +2391,19 @@ def cmd_pairs(a) -> None:
             summary[tag] = discrimination_stats(rows)
 
     if rank == 0:
+        decoding_note = (
+            "greedy decoding; seeds are recorded but no token sampling occurs"
+            if args.temperature == 0 else
+            "paired RNG seeds improve reproducibility but do not eliminate sampling "
+            "variance after pruning changes the token distribution"
+        )
         summary["_decoding"] = {
             "temperature": args.temperature,
             "max_new_tokens": a.max_new_tokens,
             "max_seq_len": a.max_seq_len,
             "paired_seeding": True,
             "seed_base": a.seed,
-            "note": "both members and every variant use torch.manual_seed(seed+pair_id)",
+            "note": decoding_note,
         }
         summary["_score_artifact"] = {
             "score_schema_version": st["score_schema_version"],
@@ -3064,9 +3070,10 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
         say(f"phase 3: evaluating variant={tag} on {len(questions)} questions")
         rows = []
         for i, q, prompt, ids in prepared:
-            # Paired comparison: question i must see the SAME sampling noise under
-            # both variants, otherwise the full/pruned delta mixes the pruning effect
-            # with decoder randomness. Reseed per question, identically on every rank.
+            # Greedy decoding is the primary comparison. Reseeding per question
+            # keeps positive-temperature robustness runs reproducible, but matching
+            # RNG streams cannot eliminate sampling variance after pruning changes
+            # the categorical token distribution.
             torch.manual_seed(a.seed + i)
             torch.cuda.manual_seed_all(a.seed + i)
             t1 = time.time()
@@ -3119,13 +3126,17 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
             }
 
     if rank == 0:
+        decoding_note = (
+            "greedy decoding; seeds are recorded but no token sampling occurs"
+            if args.temperature == 0 else
+            "paired RNG seeds improve reproducibility but do not eliminate sampling "
+            "variance after pruning changes the token distribution"
+        )
         summary["_decoding"] = {
             "temperature": args.temperature,
             "paired_seeding": True,
             "seed_base": a.seed,
-            "note": ("question i is decoded under torch.manual_seed(seed+i) in BOTH "
-                     "variants, so the full/pruned delta is not confounded by "
-                     "sampling noise"),
+            "note": decoding_note,
         }
         (out / "summary.json").write_text(json.dumps(summary, indent=1))
         say("=" * 60)
@@ -3164,8 +3175,8 @@ def main() -> None:
     sp.add_argument("--max-chunks", type=int, default=0,
                     help="maximum token-exact chunks per sample; 0 is unlimited")
     sp.add_argument("--seed", type=int, default=965)
-    sp.add_argument("--temperature", type=float, default=None,
-                    help="calibration-response temperature; default keeps model configuration")
+    sp.add_argument("--temperature", type=float, default=0.0,
+                    help="calibration-response temperature; default 0 uses greedy decoding")
 
     sp = sub.add_parser("mask", help="scores -> mask")
     sp.add_argument("--scores", required=True)
@@ -3190,8 +3201,8 @@ def main() -> None:
     sp.add_argument("--max-new-tokens", type=int, default=256)
     sp.add_argument("--seed", type=int, default=965,
                     help="item i is decoded with manual_seed(seed+i)")
-    sp.add_argument("--temperature", type=float, default=None,
-                    help="decoding temperature; default keeps the model configuration")
+    sp.add_argument("--temperature", type=float, default=0.0,
+                    help="decoding temperature; default 0 uses greedy decoding")
 
     sp = sub.add_parser("pipeline", help="profile -> mask -> eval(full) -> eval(pruned), one load")
     common(sp)
@@ -3213,9 +3224,9 @@ def main() -> None:
                     help="stop after producing scores and masks (no generation)")
     sp.add_argument("--seed", type=int, default=965,
                     help="question i is decoded with manual_seed(seed+i) in both variants")
-    sp.add_argument("--temperature", type=float, default=None,
-                    help="decoding temperature; 0 = greedy (removes sampling noise entirely). "
-                         "Default None keeps the model's configured 1.0")
+    sp.add_argument("--temperature", type=float, default=0.0,
+                    help="decoding temperature; default 0 uses greedy decoding and removes "
+                         "sampling noise from full-vs-pruned comparisons")
 
     sp = sub.add_parser("pairs", help="matched vulnerable/secure discrimination eval")
     common(sp)
@@ -3227,7 +3238,8 @@ def main() -> None:
     sp.add_argument("--keep", type=int, default=128)
     sp.add_argument("--max-new-tokens", type=int, default=128)
     sp.add_argument("--seed", type=int, default=965)
-    sp.add_argument("--temperature", type=float, default=None)
+    sp.add_argument("--temperature", type=float, default=0.0,
+                    help="decoding temperature; default 0 uses greedy decoding")
     sp.add_argument("--no-controls", action="store_true",
                     help="skip the gating-score, frequency, and random baselines")
 
@@ -3257,7 +3269,8 @@ def main() -> None:
     sp.add_argument("--max-chunks", type=int, default=0,
                     help="maximum token-exact chunks per file; 0 is unlimited")
     sp.add_argument("--seed", type=int, default=965)
-    sp.add_argument("--temperature", type=float, default=None)
+    sp.add_argument("--temperature", type=float, default=0.0,
+                    help="calibration-response temperature; default 0 uses greedy decoding")
     sp.add_argument("--fail-under", type=float, default=0.98,
                     help="fail if the recovered-norm top-k overlap with explicit "
                          "unweighted norms falls below this fraction")

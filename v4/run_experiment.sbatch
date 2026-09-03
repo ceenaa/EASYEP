@@ -95,7 +95,11 @@ MAX_CHUNKS=${MAX_CHUNKS:-0}
 # consumer of wall time. 0 evaluates every question.
 LIMIT=${LIMIT:-0}
 SEED=${SEED:-965}
-TEMPERATURE=${TEMPERATURE:-}
+# Greedy decoding is the experimental default: pruning changes the token
+# distribution, so sharing an RNG seed at nonzero temperature does not remove
+# sampling noise from full-vs-pruned comparisons. Override explicitly only for
+# a repeated-seed robustness study.
+TEMPERATURE=${TEMPERATURE:-0}
 NPROC_PER_NODE=${NPROC_PER_NODE:-4}
 
 if [[ -n ${RUN_ID:-} ]]; then

@@ -276,13 +276,81 @@ The main environment overrides are:
 | `MAX_CHUNKS` | `0` | calibration chunks per file; `0` means unlimited and a positive value is a fail-fast cap |
 | `LIMIT` | `0` | questions evaluated per variant; `0` is all of them. `N_CALIB` and `N_PAIRS` shrink the other stages, so this is the knob for a cheap end-to-end rehearsal |
 | `SEED` | `965` | calibration ordering, controls, and paired decoding seed |
-| `TEMPERATURE` | unset | keep the model default (`1.0`); set `0` for greedy decoding |
+| `TEMPERATURE` | `0` | greedy decoding for deterministic full-vs-pruned comparisons; override with a positive value only for an explicitly repeated-seed robustness study |
 | `RUN_ID` | Slurm job id | suffix of the unique output directory |
 | `RESUME` | `0` | `1` reattaches only when the complete immutable provenance and every skipped stage checkpoint still match |
 | `STRICT_PINS` | `0` | `1` aborts when the active environment does not match `requirements-v4.txt` exactly; otherwise divergences are logged |
 | `MASTER_PORT_BASE` | job-derived | first of the per-stage rendezvous ports |
 | `PYTHON_MODULE` | `python` | module used to create and run the V4 virtual environment |
 | `CUDA_MODULE` | `cuda/13.2` | CUDA module loaded in the job |
+
+### Fast development loop
+
+Use a small, complete batch rehearsal before a full experiment. It follows the
+same gates and artifact contracts while evaluating one calibration source, one
+matched pair, and one question per variant:
+
+```bash
+env -u RUN_ID -u RESUME sbatch --account=YOUR_ALLOCATION --time=03:00:00 \
+  --export=ALL,RUN_ID=dev_001,RESUME=0,TEMPERATURE=0,N_CALIB=1,N_PAIRS=1,LIMIT=1 \
+  v4/easyep.sbatch
+```
+
+Always set both `RUN_ID` and `RESUME` on submission. Clearing inherited values
+first prevents stale shell state from silently selecting an old run.
+
+When several hands-on iterations are planned for the same work block, one
+short-lived allocation avoids returning to the queue between attempts:
+
+```bash
+sbatch --account=YOUR_ALLOCATION v4/dev_hold.sbatch
+squeue -u "$USER"                         # wait for easyep_dev to run
+srun --jobid=JOB_ID --overlap --pty bash -l
+```
+
+`EASYEP_CODE_DIR` must name the attested Hugging Face snapshot used to create
+the checkpoint, including its `.cache/huggingface/download/*.metadata` files. A
+copied inference directory without that revision evidence is intentionally
+rejected even when its visible Python files match.
+
+Inside the allocation, export every site-specific path plus an explicit new
+`RUN_ID` and `RESUME=0`. The helper stages the checkpoint once under
+`$SLURM_TMPDIR`, verifies the staged copy against its provenance sidecar, and
+then launches the normal reproducible workflow:
+
+```bash
+cd /path/to/EASYEP
+export EASYEP_REPO="$PWD"
+export EASYEP_VENV=/absolute/path/to/venv
+export EASYEP_CODE_DIR=/absolute/path/to/attested-snapshot/inference
+export EASYEP_CHECKPOINT=/absolute/path/to/mp4-checkpoint
+export EASYEP_DATA_ROOT=/absolute/path/to/inputs
+export EASYEP_RESULTS_ROOT=/absolute/path/to/results
+export EASYEP_CONFIG="$PWD/v4/config_v4_flash.json"
+export RUN_ID=dev_002 RESUME=0
+export N_CALIB=1 N_PAIRS=1 LIMIT=1
+export TEMPERATURE=0
+
+bash v4/run_in_allocation.sh
+```
+
+The allocation survives an SSH disconnect; a command tied to the attached PTY
+may not. Use a normal `sbatch` submission for any unattended run. Cancel the
+development allocation when finished:
+
+```bash
+scancel JOB_ID
+```
+
+Holding the node removes repeated queue waits, but it does not keep model state
+warm: every GPU stage below is still a separate `torchrun` process. Node-local
+staging makes those reloads substantially cheaper; eliminating them entirely
+requires a persistent multi-stage Python worker and is a separate change to the
+execution and checkpoint model.
+
+For the complete Rorqual workflow, site-specific paths, monitoring commands,
+resume rules, and failure recovery, see
+[`COMPUTE_CANADA_RUNBOOK.md`](COMPUTE_CANADA_RUNBOOK.md).
 
 A stage that exits zero atomically records a JSON checkpoint under
 `run_RUN_ID/.stages/`. Each checkpoint binds the immutable run-provenance hash,
@@ -482,13 +550,13 @@ references to the trunk embedding and head (`Transformer.__init__` assigns
 
 ## Open items
 
-- **Paired decoding.** `config_v4_flash.json` sets no `temperature`, so `ModelArgs`
-  defaults to 1.0 and `Transformer.forward` samples every token via Gumbel-max,
-  which consumes RNG. Seeding once at load would decode `full` and `pruned` under
-  different noise and confound the comparison. Question *i* is therefore decoded
-  under `manual_seed(seed + i)` in **every** variant; submit with `TEMPERATURE=0`
-  for greedy decoding if an entirely noise-free A/B is wanted. The regime used is
-  recorded in `questions/summary.json` under `_decoding`.
+- **Decoding control.** The experiment launcher and direct CLI commands default
+  to `TEMPERATURE=0`, making the primary full-vs-pruned comparison greedy and
+  deterministic. Question *i* is still decoded under `manual_seed(seed + i)` in
+  every variant for reproducibility when a positive temperature is explicitly
+  requested, but matching seeds alone do not remove sampling variance once
+  pruning changes the token distribution. The regime used is recorded in
+  `questions/summary.json` under `_decoding`.
 - **MTP layers are excluded, not handled.** `DSparkBlock.forward` delegates to
   `Block.forward` when `start_pos > 0` with `layer_id` 43–45; the accumulator is
   bounds-guarded against that. They have their own experts under the `mtp.*`
