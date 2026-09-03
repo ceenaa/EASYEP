@@ -271,8 +271,8 @@ The main environment overrides are:
 | `N_CALIB` | `25` | calibration source files; token-exact chunking may produce more profiling trajectories |
 | `N_PAIRS` | `25` | matched vulnerable/secure pairs |
 | `MAX_SEQ_LEN` | `16384` | context window used by each stage. Not the config's `original_seq_len=65536`: prefill memory is quadratic and unblocked (~`16*T^2` bytes) against ~35 GiB of headroom, so 65536 OOMs and 24576 is the ceiling, enforced by both the launcher and `build()`. Token-exact chunking preserves whole sources, so a smaller window costs no coverage |
-| `MAX_NEW_TOKENS` | `256` | question-evaluation response limit |
-| `PAIR_MAX_NEW_TOKENS` | `128` | matched-pair response limit |
+| `MAX_NEW_TOKENS` | `2048` | question-evaluation response limit. Sized for reasoning mode, where the chain of thought precedes the answer; too small truncates before the answer is reached |
+| `PAIR_MAX_NEW_TOKENS` | `1024` | matched-pair response limit, same reasoning-mode sizing |
 | `MAX_CHUNKS` | `0` | calibration chunks per file; `0` means unlimited and a positive value is a fail-fast cap |
 | `SEED` | `965` | calibration ordering, controls, and paired decoding seed |
 | `TEMPERATURE` | unset | keep the model default (`1.0`); set `0` for greedy decoding |
@@ -359,10 +359,21 @@ the discrimination evaluation cannot reuse a profiled program. The selected
 paths and their content/token identities are persisted in `pairs_used.json`.
 That exclusion is only as good as the paths the score artifact recorded, so the
 score schema also records *which* calibration distribution produced it
-(`source_kind`, `security_prompt`). `pairs` refuses an artifact profiled from
+(`source_kind`, `security_prompt`, `thinking_mode`). `pairs` refuses an artifact profiled from
 sample texts, whose synthetic names match nothing in the corpus and would make
 the exclusion silently vacuous, or one profiled without the security-review
-prompt, whose routing statistics come from a different distribution.
+prompt, whose routing statistics come from a different distribution. The same
+applies across thinking modes: every prompt this pipeline encodes goes through
+the single `THINKING_MODE` constant (currently `reasoning`), and an artifact
+profiled under a different mode is refused rather than silently reused, because
+the mode changes what the model emits and therefore which experts route.
+
+Because reasoning-mode completions carry the chain of thought ahead of the
+answer, the matched-pair eval parses its verdict from the answer alone. A trace
+that considers `Verdict: SAFE` before settling on `Verdict: VULNERABLE` would
+otherwise read as two conflicting verdicts and score as an abstention. The full
+completion is still stored and still goes to the judge; `answer` is recorded
+beside it.
 
 `score_comparison.json` shows where the primary and no-`simibr` rules disagree;
 running both measures whether the token-contribution term helps. The standalone
@@ -372,7 +383,7 @@ frequency, and random controls.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 56 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 58 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask

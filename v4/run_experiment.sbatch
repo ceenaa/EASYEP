@@ -82,8 +82,13 @@ N_PAIRS=${N_PAIRS:-25}
 # Chunking keeps whole sources, so a smaller window is not a loss of coverage --
 # raising this makes each chunk the OOM case instead of avoiding chunking.
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
-PAIR_MAX_NEW_TOKENS=${PAIR_MAX_NEW_TOKENS:-128}
+# Sized for reasoning mode, not chat. The model emits a chain of thought before
+# the answer, so the old 256/128 budgets truncated mid-deliberation: the pair
+# eval would never reach its "Verdict:" line and every row would score as an
+# abstention. These are estimates -- measure completion_tokens in the first run
+# and tighten them, because they dominate the wall time.
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-2048}
+PAIR_MAX_NEW_TOKENS=${PAIR_MAX_NEW_TOKENS:-1024}
 MAX_CHUNKS=${MAX_CHUNKS:-0}
 SEED=${SEED:-965}
 TEMPERATURE=${TEMPERATURE:-}

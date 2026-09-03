@@ -72,6 +72,11 @@ MHC_SCORE_CHUNK_TOKENS = 1024
 # too, but standalone invocations bypass the launcher, so enforce it here where
 # every mode passes through.
 MAX_SUPPORTED_SEQ_LEN = 24576
+# Every prompt this pipeline encodes -- calibration, parity, questions, pairs --
+# goes through one mode. Scattered literals drift, and a mismatch between the
+# profiled and evaluated distributions is invisible in the numbers, so there is
+# exactly one definition and it is recorded in the score artifact.
+THINKING_MODE = "reasoning"
 
 
 @contextmanager
@@ -1315,7 +1320,7 @@ def _calibration_chunks(files: list[tuple[str, str]], tok, encode_messages,
         content = (security_review_text(relative_path, piece)
                    if security_prompt else piece)
         prompt = encode_messages([{"role": "user", "content": content}],
-                                 thinking_mode="chat")
+                                 thinking_mode=THINKING_MODE)
         return tok.encode(prompt)
 
     def split_to_fit(relative_path: str, piece: str) -> list[tuple[str, list[int]]]:
@@ -1469,6 +1474,10 @@ def _calibration_provenance(files: list[tuple[str, str]], inputs: list[dict],
         "provenance_schema_version": 1,
         "source_kind": source_kind,
         "security_prompt": bool(security_prompt),
+        # The thinking mode changes what the model emits and therefore which
+        # experts route, so it identifies the calibration distribution just as
+        # much as the prompt does.
+        "thinking_mode": THINKING_MODE,
         "source_samples": len(files),
         "chunks": len(inputs),
         "forwards": int(result["forwards"]),
@@ -1522,6 +1531,13 @@ def _require_evaluation_calibration(state: dict, source: str, *,
             f"{source} was profiled without the security-review prompt, so its "
             "routing statistics come from a different distribution than this "
             "evaluation. Re-profile with `pipeline --calib-dir`.")
+    if calibration.get("thinking_mode") != THINKING_MODE:
+        raise SystemExit(
+            f"{source} was profiled in thinking_mode "
+            f"{calibration.get('thinking_mode')!r} but this build evaluates in "
+            f"{THINKING_MODE!r}. The mode changes what the model emits and which "
+            "experts route, so the masks would come from a different "
+            "distribution than the evaluation. Re-profile.")
     if need_corpus_paths and calibration.get("source_kind") != "corpus_files":
         raise SystemExit(
             f"{source} was profiled from {calibration.get('source_kind')!r}, whose "
@@ -1543,6 +1559,10 @@ def _validate_calibration_provenance(record: Any, source: str = "score artifact"
         raise SystemExit(
             f"{source} does not record whether calibration used the security-review "
             "prompt; re-profile with this easyep_v4.py")
+    if not isinstance(record.get("thinking_mode"), str) or not record["thinking_mode"]:
+        raise SystemExit(
+            f"{source} does not record the calibration thinking mode; "
+            "re-profile with this easyep_v4.py")
     integer_fields = ("source_samples", "chunks", "forwards", "response_tokens")
     if any(isinstance(record.get(key), bool) or not isinstance(record.get(key), int)
            or record[key] < 1 for key in integer_fields):
@@ -1977,6 +1997,30 @@ def _pair_eval_items(pairs: list[dict]) -> list[tuple[int, str, str, str]]:
     return items
 
 
+def final_message(parse_message, completion: str) -> str:
+    """Return the answer without the reasoning trace.
+
+    In reasoning mode the completion carries the chain of thought ahead of the
+    answer, and deliberation legitimately contains discarded hypotheses -- a
+    "Verdict: SAFE" the model then argues itself out of. parse_verdict treats
+    two conflicting valid verdicts as an abstention, so scanning the trace would
+    turn ordinary reasoning into systematic unparsed rows. Grade the answer, not
+    the thinking; the full completion is still stored and still judged.
+    """
+    try:
+        message = parse_message(completion, thinking_mode=THINKING_MODE)
+    except Exception:
+        return completion
+    if isinstance(message, str):
+        return message if message.strip() else completion
+    if isinstance(message, dict):
+        for key in ("content", "message", "text"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return completion
+
+
 def parse_verdict(text: str) -> str | None:
     verdicts = set()
     for line in text.splitlines():
@@ -2061,7 +2105,7 @@ def cmd_pairs(a) -> None:
         a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1, a.temperature)
     model_identity = _model_identity(a.ckpt_path, a.config, a.code_dir, world_size)
     sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
-    from encoding_dsv4 import encode_messages
+    from encoding_dsv4 import encode_messages, parse_message_from_completion_text
     sys.path.insert(0, a.code_dir)
     from generate import generate
 
@@ -2101,7 +2145,7 @@ def cmd_pairs(a) -> None:
         for _, _, path, code in _pair_eval_items([candidate]):
             ids = tok.encode(encode_messages(
                 [{"role": "user", "content": VERDICT_PROMPT.format(path=path, code=code)}],
-                thinking_mode="chat"))
+                thinking_mode=THINKING_MODE))
             if len(ids) > input_limit:
                 return False
         return True
@@ -2129,7 +2173,7 @@ def cmd_pairs(a) -> None:
         prompt = VERDICT_PROMPT.format(path=path, code=code)
         ids = tok.encode(encode_messages(
             [{"role": "user", "content": prompt}],
-            thinking_mode="chat"))
+            thinking_mode=THINKING_MODE))
         if len(ids) > input_limit:
             raise ValueError(
                 f"matched pair {pid} prompt has {len(ids)} tokens but only "
@@ -2186,6 +2230,7 @@ def cmd_pairs(a) -> None:
             with torch.inference_mode():
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion, n_completion = _decode_completion(tok, gen, ids)
+            answer = final_message(parse_message_from_completion_text, completion)
             if rank == 0:
                 rows.append({"pair_id": pid, "truth": item["truth"],
                              "path": item["path"],
@@ -2194,7 +2239,8 @@ def cmd_pairs(a) -> None:
                              "prompt": item["prompt"],
                              "prompt_sha256": item["prompt_sha256"],
                              "prompt_ids_sha256": _ids_sha256(ids),
-                             "verdict": parse_verdict(completion),
+                             "verdict": parse_verdict(answer),
+                             "answer": answer,
                              "completion": completion,
                              "seed": a.seed + pid,
                              "temperature": args.temperature,
@@ -2398,7 +2444,7 @@ def _logits_for(model, tok, encode_messages, prompts, max_seq_len, dev):
     outs = []
     for text in prompts:
         ids = tok.encode(encode_messages([{"role": "user", "content": text}],
-                                         thinking_mode="chat"))
+                                         thinking_mode=THINKING_MODE))
         if not ids or len(ids) > max_seq_len:
             raise ValueError(
                 f"parity prompt has {len(ids)} tokens but max_seq_len is {max_seq_len}; "
@@ -2863,7 +2909,7 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
     for i, q in enumerate(questions):
         prompt = question_text(q)
         ids = tok.encode(encode_messages(
-            [{"role": "user", "content": prompt}], thinking_mode="chat"))
+            [{"role": "user", "content": prompt}], thinking_mode=THINKING_MODE))
         if len(ids) > input_limit:
             raise ValueError(
                 f"question {q.get('id', i)} has {len(ids)} prompt tokens but only "

@@ -13,6 +13,7 @@ model load.
 import hashlib
 import hmac
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -100,6 +101,7 @@ def fixture_calibration_provenance():
     return {
         "provenance_schema_version": 1,
         "source_kind": "corpus_files", "security_prompt": True,
+        "thinking_mode": E.THINKING_MODE,
         "source_samples": 1, "chunks": 1, "forwards": 1, "response_tokens": 1,
         "parameters": {"seed": 965, "temperature": 1.0, "max_seq_len": 64,
                        "max_new_tokens": 8, "max_chunks": 0},
@@ -133,6 +135,50 @@ def t_cutoff_diagnostics_expose_an_arbitrary_tie_break():
     assert clean["max_experts_tied_at_cutoff"] == 1
     for row in clean["per_layer"]:
         assert row["absolute_margin"] > 0 and row["cut_is_arbitrary"] is False
+
+
+def t_verdict_is_read_from_the_answer_not_the_reasoning():
+    """Discarded hypotheses in a reasoning trace must not become abstentions."""
+    # a clean, parseable verdict the model then argues itself out of
+    trace = ("First pass, the value looks escaped, so:\n"
+             "Verdict: SAFE\n"
+             "But req.query.name reaches res.send unescaped.\n")
+    answer = "Verdict: VULNERABLE\nVulnerability: XSS\nReasoning: unescaped sink"
+
+    # scanning the whole completion sees two conflicting verdicts -> abstention
+    assert E.parse_verdict(trace + answer) is None
+    # reading the answer alone recovers the real one
+    assert E.parse_verdict(answer) == "VULNERABLE"
+
+    def parse_message(completion, thinking_mode):
+        assert thinking_mode == E.THINKING_MODE
+        return completion.split("But req.query.name reaches res.send unescaped.\n")[-1]
+
+    assert E.parse_verdict(E.final_message(parse_message, trace + answer)) == "VULNERABLE"
+
+    # a parser that fails, returns nothing usable, or hands back a dict all
+    # degrade to the raw completion rather than losing the row
+    def boom(_c, thinking_mode):
+        raise RuntimeError("encoding module changed shape")
+    assert E.final_message(boom, answer) == answer
+    assert E.final_message(lambda c, thinking_mode: "   ", answer) == answer
+    assert E.final_message(lambda c, thinking_mode: {"content": answer}, "x") == answer
+
+
+def t_every_prompt_uses_one_thinking_mode():
+    """Calibration, parity, questions and pairs must encode identically.
+
+    A mode mismatch between the profiled and evaluated distributions does not
+    show up as an error, only as scores that quietly describe a different
+    workload, so there is one constant and no literals.
+    """
+    assert E.THINKING_MODE == "reasoning"
+    source = inspect.getsource(E)
+    assert 'thinking_mode="chat"' not in source, "a literal thinking mode came back"
+    assert "thinking_mode=THINKING_MODE" in source
+    # every encode_messages call site routes through the constant
+    calls = re.findall(r"thinking_mode=([A-Za-z_\"][\w\"]*)", source)
+    assert calls and set(calls) == {"THINKING_MODE"}, f"unexpected modes: {set(calls)}"
 
 
 def t_calibration_loader_refuses_to_guess_at_text():
@@ -194,6 +240,17 @@ def t_calibration_provenance_records_its_distribution():
                    lambda n=need_paths: E._require_evaluation_calibration(
                        {"calibration": raw}, "fixture", need_corpus_paths=n),
                    "different distribution")
+    crossed = json.loads(json.dumps(good)); crossed["thinking_mode"] = "chat"
+    for need_paths in (False, True):
+        must_raise(SystemExit,
+                   lambda n=need_paths: E._require_evaluation_calibration(
+                       {"calibration": crossed}, "fixture", need_corpus_paths=n),
+                   "thinking_mode")
+    dropped = json.loads(json.dumps(good)); del dropped["thinking_mode"]
+    must_raise(SystemExit,
+               lambda: E._validate_calibration_provenance(dropped),
+               "thinking mode")
+
     samples = json.loads(json.dumps(good)); samples["source_kind"] = "sample_texts"
     # usable for the question evaluation, not for matched-pair exclusion
     assert E._require_evaluation_calibration(
@@ -1557,7 +1614,7 @@ def t_calibration_chunking_covers_the_whole_file():
             return [ord(c) for c in prompt]
 
     def encode_messages(messages, thinking_mode):
-        assert messages and thinking_mode == "chat"
+        assert messages and thinking_mode == E.THINKING_MODE
         return messages[0]["content"]
 
     def pieces_of(inputs):
@@ -1646,7 +1703,7 @@ def t_calibration_profiles_prompt_and_generated_response_once():
             return list(range(40))
 
     def encode_messages(messages, thinking_mode):
-        assert messages and thinking_mode == "chat"
+        assert messages and thinking_mode == E.THINKING_MODE
         return "encoded"
 
     inputs = E._calibration_chunks(
