@@ -16,7 +16,7 @@
 #SBATCH --gpus-per-node=h100:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=450G
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=easyep-%x-%j.out
 
 set -euo pipefail
@@ -90,6 +90,10 @@ MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-2048}
 PAIR_MAX_NEW_TOKENS=${PAIR_MAX_NEW_TOKENS:-1024}
 MAX_CHUNKS=${MAX_CHUNKS:-0}
+# Rehearsal knob. N_CALIB and N_PAIRS already shrink profiling and the pair
+# eval; the question eval had no equivalent, and it is the largest single
+# consumer of wall time. 0 evaluates every question.
+LIMIT=${LIMIT:-0}
 SEED=${SEED:-965}
 TEMPERATURE=${TEMPERATURE:-}
 NPROC_PER_NODE=${NPROC_PER_NODE:-4}
@@ -143,6 +147,7 @@ require_uint MAX_SEQ_LEN "$MAX_SEQ_LEN" 2 24576
 require_uint MAX_NEW_TOKENS "$MAX_NEW_TOKENS" 1
 require_uint PAIR_MAX_NEW_TOKENS "$PAIR_MAX_NEW_TOKENS" 1
 require_uint MAX_CHUNKS "$MAX_CHUNKS" 0
+require_uint LIMIT "$LIMIT" 0
 require_uint SEED "$SEED" 0
 require_uint NPROC_PER_NODE "$NPROC_PER_NODE" 4 4
 if (( MAX_NEW_TOKENS >= MAX_SEQ_LEN || PAIR_MAX_NEW_TOKENS >= MAX_SEQ_LEN )); then
@@ -306,17 +311,17 @@ if [[ $RESUME == 1 && -d $OUT ]]; then
   # with different ones would silently splice incompatible halves together.
   if ! "$VENV/bin/python" - "$OUT/RUN_MANIFEST.json" \
       "$KEEP" "$N_CALIB" "$N_PAIRS" "$MAX_SEQ_LEN" "$MAX_NEW_TOKENS" \
-      "$PAIR_MAX_NEW_TOKENS" "$MAX_CHUNKS" "$SEED" "$TEMPERATURE" <<'PYRESUME'; then
+      "$PAIR_MAX_NEW_TOKENS" "$MAX_CHUNKS" "$SEED" "$LIMIT" "$TEMPERATURE" <<'PYRESUME'; then
 import json, sys
 manifest, argv = json.loads(open(sys.argv[1], encoding="utf-8").read()), sys.argv[2:]
 names = ("keep", "n_calib", "n_pairs", "max_seq_len", "max_new_tokens",
-         "pair_max_new_tokens", "max_chunks", "seed")
+         "pair_max_new_tokens", "max_chunks", "seed", "question_limit")
 previous = manifest.get("parameters", {})
 changed = []
 for name, value in zip(names, argv):
     if previous.get(name) != int(value):
         changed.append(f"{name}: was {previous.get(name)!r}, now {int(value)}")
-wanted = None if argv[8] == "" else float(argv[8])
+wanted = None if argv[9] == "" else float(argv[9])
 if previous.get("temperature") != wanted:
     changed.append(f"temperature: was {previous.get('temperature')!r}, now {wanted!r}")
 for line in changed:
@@ -344,7 +349,7 @@ fi
   "$GIT_SHA" "$GIT_TRACKED_DIRTY" \
   "$MODEL_ID" "$MODEL_REVISION" "$INFERENCE_REVISION" \
   "$KEEP" "$N_CALIB" "$N_PAIRS" "$MAX_SEQ_LEN" "$MAX_NEW_TOKENS" \
-  "$PAIR_MAX_NEW_TOKENS" "$MAX_CHUNKS" "$SEED" "$TEMPERATURE" \
+  "$PAIR_MAX_NEW_TOKENS" "$MAX_CHUNKS" "$SEED" "$TEMPERATURE" "$LIMIT" \
   "$NPROC_PER_NODE" <<'PY'
 import datetime
 import hashlib
@@ -361,7 +366,7 @@ import sys
     checkpoint_provenance, data_root, venv,
     git_sha, git_tracked_dirty, model_id, model_revision,
     inference_revision, keep, n_calib, n_pairs, max_seq_len, max_new_tokens,
-    pair_max_new_tokens, max_chunks, seed, temperature, nproc,
+    pair_max_new_tokens, max_chunks, seed, temperature, question_limit, nproc,
 ) = sys.argv[1:]
 
 def digest(path, capture=False):
@@ -476,6 +481,7 @@ manifest = {
                    "max_new_tokens": int(max_new_tokens),
                    "pair_max_new_tokens": int(pair_max_new_tokens),
                    "validate_n_calib": int(n_calib), "max_chunks": int(max_chunks),
+                   "question_limit": int(question_limit),
                    "seed": int(seed),
                    "temperature": None if temperature == "" else float(temperature),
                    "nproc_per_node": int(nproc)},
@@ -669,6 +675,7 @@ run_stage eval pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --questions "$DATA_ROOT/questions_used.json" \
   --scores-in "$OUT/scores/expert_scores.pt" \
   --out "$OUT/questions" --keep "$KEEP" --seed "$SEED" \
+  --limit "$LIMIT" \
   --max-new-tokens "$MAX_NEW_TOKENS"
 
 run_stage pairs pairs "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \

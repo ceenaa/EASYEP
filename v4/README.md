@@ -274,6 +274,7 @@ The main environment overrides are:
 | `MAX_NEW_TOKENS` | `2048` | question-evaluation response limit. Sized for reasoning mode, where the chain of thought precedes the answer; too small truncates before the answer is reached |
 | `PAIR_MAX_NEW_TOKENS` | `1024` | matched-pair response limit, same reasoning-mode sizing |
 | `MAX_CHUNKS` | `0` | calibration chunks per file; `0` means unlimited and a positive value is a fail-fast cap |
+| `LIMIT` | `0` | questions evaluated per variant; `0` is all of them. `N_CALIB` and `N_PAIRS` shrink the other stages, so this is the knob for a cheap end-to-end rehearsal |
 | `SEED` | `965` | calibration ordering, controls, and paired decoding seed |
 | `TEMPERATURE` | unset | keep the model default (`1.0`); set `0` for greedy decoding |
 | `RUN_ID` | Slurm job id | suffix of the unique output directory |
@@ -383,7 +384,7 @@ frequency, and random controls.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 58 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 59 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask
@@ -414,7 +415,7 @@ completion, and nothing that scores it.
 ```
 
 `to_judge.jsonl` is one line per (item, system): snippet, exact prompt,
-completion, an opaque system label, and (for the question set) a separate
+completion, the `answer` with the reasoning trace stripped, an opaque system label, and (for the question set) a separate
 `reference` block. Paired judging refuses legacy completion rows that omit the
 snippet or prompt, rather than emitting an answer that a reasoning judge cannot
 assess. The variant mapping is withheld

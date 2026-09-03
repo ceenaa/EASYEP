@@ -137,6 +137,43 @@ def t_cutoff_diagnostics_expose_an_arbitrary_tie_break():
         assert row["absolute_margin"] > 0 and row["cut_is_arbitrary"] is False
 
 
+def t_judging_bundle_carries_the_answer_beside_the_reasoning():
+    """An external judge must be able to grade the answer, not a wall of trace."""
+    with tempfile.TemporaryDirectory() as td:
+        src, out = Path(td) / "res", Path(td) / "judge"
+        src.mkdir()
+        for tag in ("full", "pruned_paper"):
+            with (src / f"answers_{tag}.jsonl").open("w") as fp:
+                fp.write(json.dumps({
+                    "id": "Q01", "snippet": "var x=1;", "prompt": "review Q01",
+                    "completion": "long reasoning ...\nVerdict: VULNERABLE",
+                    "answer": "Verdict: VULNERABLE", "variant": tag,
+                }) + "\n")
+
+        class A:
+            results, pairs, seed, questions = str(src), False, 7, ""
+        a = A(); a.out = str(out)
+        E.cmd_blind(a)
+        items = [json.loads(l) for l in
+                 (out / "to_judge.jsonl").read_text().splitlines()]
+        assert len(items) == 2
+        for item in items:
+            assert item["answer"] == "Verdict: VULNERABLE"
+            assert "long reasoning" in item["completion"], "trace must stay available"
+            assert "variant" not in item and "_variant" not in item
+
+        # rows without an answer (legacy) simply omit the field
+        (src / "answers_full.jsonl").write_text(json.dumps({
+            "id": "Q01", "snippet": "var x=1;", "prompt": "review Q01",
+            "completion": "only a completion", "variant": "full"}) + "\n")
+        out2 = Path(td) / "judge2"
+        a.out = str(out2)
+        E.cmd_blind(a)
+        legacy = [json.loads(l) for l in
+                  (out2 / "to_judge.jsonl").read_text().splitlines()]
+        assert any("answer" not in i for i in legacy)
+
+
 def t_verdict_is_read_from_the_answer_not_the_reasoning():
     """Discarded hypotheses in a reasoning trace must not become abstentions."""
     # a clean, parseable verdict the model then argues itself out of
@@ -154,15 +191,26 @@ def t_verdict_is_read_from_the_answer_not_the_reasoning():
         assert thinking_mode == E.THINKING_MODE
         return completion.split("But req.query.name reaches res.send unescaped.\n")[-1]
 
-    assert E.parse_verdict(E.final_message(parse_message, trace + answer)) == "VULNERABLE"
+    text, extracted = E.final_message(parse_message, trace + answer)
+    assert extracted is True and E.parse_verdict(text) == "VULNERABLE"
 
     # a parser that fails, returns nothing usable, or hands back a dict all
-    # degrade to the raw completion rather than losing the row
+    # degrade to the raw completion rather than losing the row -- and say so,
+    # because a silent total fallback is indistinguishable from working
     def boom(_c, thinking_mode):
         raise RuntimeError("encoding module changed shape")
-    assert E.final_message(boom, answer) == answer
-    assert E.final_message(lambda c, thinking_mode: "   ", answer) == answer
-    assert E.final_message(lambda c, thinking_mode: {"content": answer}, "x") == answer
+    assert E.final_message(boom, answer) == (answer, False)
+    assert E.final_message(lambda c, thinking_mode: "   ", answer) == (answer, False)
+    assert E.final_message(
+        lambda c, thinking_mode: {"content": answer}, "x") == (answer, True)
+    assert E.final_message(lambda c, thinking_mode: 42, answer) == (answer, False)
+
+    # and the summary surfaces how often extraction actually worked
+    rows = [{"truth": "VULNERABLE", "verdict": "VULNERABLE", "completion": "c",
+             "answer": "a", "answer_extracted": False},
+            {"truth": "SAFE", "verdict": "SAFE", "completion": "c",
+             "answer": "a", "answer_extracted": True}]
+    assert E.discrimination_stats(rows)["answer_extraction_rate"] == 0.5
 
 
 def t_every_prompt_uses_one_thinking_mode():

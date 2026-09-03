@@ -1997,7 +1997,7 @@ def _pair_eval_items(pairs: list[dict]) -> list[tuple[int, str, str, str]]:
     return items
 
 
-def final_message(parse_message, completion: str) -> str:
+def final_message(parse_message, completion: str) -> tuple[str, bool]:
     """Return the answer without the reasoning trace.
 
     In reasoning mode the completion carries the chain of thought ahead of the
@@ -2006,19 +2006,25 @@ def final_message(parse_message, completion: str) -> str:
     two conflicting valid verdicts as an abstention, so scanning the trace would
     turn ordinary reasoning into systematic unparsed rows. Grade the answer, not
     the thinking; the full completion is still stored and still judged.
+
+    Returns (text, extracted). The fallback is deliberately total -- a parser
+    that raises or returns nothing usable must not lose a row -- but a silent
+    total fallback would put us straight back to reading verdicts out of the
+    reasoning trace with no sign anything was wrong. The caller records the flag
+    so the summary can say how often extraction actually worked.
     """
     try:
         message = parse_message(completion, thinking_mode=THINKING_MODE)
     except Exception:
-        return completion
+        return completion, False
     if isinstance(message, str):
-        return message if message.strip() else completion
+        return (message, True) if message.strip() else (completion, False)
     if isinstance(message, dict):
         for key in ("content", "message", "text"):
             value = message.get(key)
             if isinstance(value, str) and value.strip():
-                return value
-    return completion
+                return value, True
+    return completion, False
 
 
 def parse_verdict(text: str) -> str | None:
@@ -2095,7 +2101,19 @@ def discrimination_stats(rows: list[dict]) -> dict:
             "youden_j": 0.0, "balanced_accuracy": 0.5,
         },
         "unparsed_verdicts": unparsed,
-        "mean_words": round(sum(len(r["completion"].split()) for r in rows) / max(len(rows), 1), 1),
+        # In reasoning mode the completion is mostly chain of thought, so a
+        # single "mean_words" would silently stop measuring the answer. Report
+        # both: the answer is what the verdict came from, the completion is what
+        # the run actually spent tokens on.
+        # If this is 0, the encoding parser is not returning what we expect and
+        # every verdict was read from the raw completion, reasoning included.
+        "answer_extraction_rate": round(
+            sum(1 for r in rows if r.get("answer_extracted")) / max(len(rows), 1), 3),
+        "mean_answer_words": round(
+            sum(len(str(r.get("answer") or r["completion"]).split()) for r in rows)
+            / max(len(rows), 1), 1),
+        "mean_completion_words": round(
+            sum(len(r["completion"].split()) for r in rows) / max(len(rows), 1), 1),
     }
 
 
@@ -2230,7 +2248,8 @@ def cmd_pairs(a) -> None:
             with torch.inference_mode():
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion, n_completion = _decode_completion(tok, gen, ids)
-            answer = final_message(parse_message_from_completion_text, completion)
+            answer, answer_extracted = final_message(
+                parse_message_from_completion_text, completion)
             if rank == 0:
                 rows.append({"pair_id": pid, "truth": item["truth"],
                              "path": item["path"],
@@ -2241,6 +2260,7 @@ def cmd_pairs(a) -> None:
                              "prompt_ids_sha256": _ids_sha256(ids),
                              "verdict": parse_verdict(answer),
                              "answer": answer,
+                             "answer_extracted": answer_extracted,
                              "completion": completion,
                              "seed": a.seed + pid,
                              "temperature": args.temperature,
@@ -2272,11 +2292,13 @@ def cmd_pairs(a) -> None:
         (out / "pairs_summary.json").write_text(json.dumps(summary, indent=1))
         say("=" * 72)
         say("DISCRIMINATION  (matched vulnerable/secure pairs)")
-        say(f"{'variant':<20}{'TPR':>8}{'safeerr':>8}{'J':>8}{'balacc':>9}{'words':>8}")
+        say(f"{'variant':<20}{'TPR':>8}{'safeerr':>8}{'J':>8}{'balacc':>9}"
+            f"{'answ.w':>8}{'cov':>7}")
         for tag, _ in variants:
             d = summary[tag]
             say(f"{tag:<20}{d['tpr_recall']:>8.3f}{d['safe_error_rate']:>8.3f}"
-                f"{d['youden_j']:>8.3f}{d['balanced_accuracy']:>9.3f}{d['mean_words']:>8.1f}")
+                f"{d['youden_j']:>8.3f}{d['balanced_accuracy']:>9.3f}"
+                f"{d['mean_answer_words']:>8.1f}{d['verdict_coverage']:>7.2f}")
         say("always-VULNERABLE baseline: TPR 1.000  safeerr 1.000  J 0.000  balacc 0.500")
         say("=" * 72)
     if world_size > 1:
@@ -2398,6 +2420,10 @@ def cmd_blind(a) -> None:
             "item": item_id,
             "system": tag2label[r["_variant"]],
             "completion": r["completion"],
+            # In reasoning mode the completion is mostly chain of thought.
+            # Publish the answer separately so a judge can grade the answer and
+            # consult the reasoning, rather than being handed one blob.
+            **({"answer": r["answer"]} if r.get("answer") else {}),
             # what was asked, so the answer can actually be graded
             **judge_input,
             # reference answer, withheld from a blind-quality pass but needed for
@@ -2893,6 +2919,7 @@ def cmd_pipeline(a) -> None:
 def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
               encode_messages, generate, variants) -> None:
     """variants: list of (tag, mask_or_None), all decoded under identical per-question seeds."""
+    from encoding_dsv4 import parse_message_from_completion_text
     questions = json.loads(Path(a.questions).read_text(encoding="utf-8"))
     if isinstance(questions, dict):
         questions = questions.get("questions", [])
@@ -2931,6 +2958,8 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
             with torch.inference_mode():
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion, n_completion = _decode_completion(tok, gen, ids)
+            answer, answer_extracted = final_message(
+                parse_message_from_completion_text, completion)
             if rank == 0:
                 rows.append({
                     "id": q.get("id"),
@@ -2943,6 +2972,11 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                     "vulnerability": q.get("vulnerability"),
                     "expected_reasoning": q.get("expected_reasoning"),
                     "completion": completion,
+                    # the answer with the chain of thought stripped, so an
+                    # external judge can grade the answer without wading
+                    # through (or being swayed by) the deliberation
+                    "answer": answer,
+                    "answer_extracted": answer_extracted,
                     "seed": a.seed + i,
                     "temperature": args.temperature,
                     "prompt_tokens": len(ids),
@@ -2954,10 +2988,20 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
             with (out / f"answers_{tag}.jsonl").open("w", encoding="utf-8") as fp:
                 for r in rows:
                     fp.write(json.dumps(r) + "\n")
-            summary[tag] = {"n": len(rows),
-                            "mean_seconds": round(sum(r["seconds"] for r in rows) / max(len(rows), 1), 2),
-                            "mean_words": round(sum(len(r["completion"].split()) for r in rows)
-                                                / max(len(rows), 1), 1)}
+            summary[tag] = {
+                "n": len(rows),
+                "mean_seconds": round(
+                    sum(r["seconds"] for r in rows) / max(len(rows), 1), 2),
+                # includes the reasoning trace, not just the answer
+                "mean_completion_words": round(
+                    sum(len(r["completion"].split()) for r in rows)
+                    / max(len(rows), 1), 1),
+                # the numbers that size the next run's token budget
+                "mean_completion_tokens": round(
+                    sum(r["completion_tokens"] for r in rows) / max(len(rows), 1), 1),
+                "max_completion_tokens": max(
+                    (r["completion_tokens"] for r in rows), default=0),
+            }
 
     if rank == 0:
         summary["_decoding"] = {
@@ -2975,7 +3019,8 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
         for tag in [t for t, _ in variants]:
             st_ = summary.get(tag, {})
             say(f"  {tag:17s} n={st_.get('n')}  mean {st_.get('mean_seconds')}s  "
-                f"{st_.get('mean_words')} words -> answers_{tag}.jsonl")
+                f"{st_.get('mean_completion_tokens')} tok "
+                f"(max {st_.get('max_completion_tokens')}) -> answers_{tag}.jsonl")
         say("  no scoring applied; grade with `blind` + your own judge")
         say("=" * 60)
     if world_size > 1:
