@@ -1523,6 +1523,38 @@ def t_deterministic_score_reduction_scope_restores_global_setting():
         torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
 
 
+def t_score_artifact_survives_a_weights_only_round_trip():
+    """The artifact must reload under the torch>=2.6 weights_only default.
+
+    A single torch.__version__ (a TorchVersion instance, not a str) in the state
+    made every artifact unloadable: profiling wrote it happily, and the eval
+    stage died on torch.load an hour later. Save/load is the only way to catch
+    a non-plain type getting into the state.
+    """
+    identity = fixture_model_identity()
+    profiler = E.Profiler(4, 8, torch.device("cpu"))
+    profiler.gate_topk = 2
+    profiler.tokens_seen = 1
+    profiler.note_reduction_determinism(True)
+    state = profiler.state(1, identity)
+    state["calibration"] = fixture_calibration_provenance()
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "expert_scores.pt"
+        torch.save(state, path)
+        # exactly how every consumer reads it back
+        loaded = torch.load(path, map_location="cpu", weights_only=True)
+        assert E._require_score_artifact(
+            loaded, "round-trip", n_hash_layers=1, model_identity=identity) is loaded
+
+    # every scalar in the state must be a plain type, not a subclass instance
+    for key, value in state.items():
+        if isinstance(value, (str, int, float, bool)):
+            assert type(value) in (str, int, float, bool), (
+                f"state[{key!r}] is {type(value).__name__}, a subclass the "
+                "weights_only unpickler will reject")
+
+
 def t_score_artifact_schema_rejects_stale_or_incomplete_scores():
     identity = fixture_model_identity()
     profiler = E.Profiler(4, 8, torch.device("cpu"))
@@ -1746,8 +1778,12 @@ def t_calibration_manifest_sampling_is_balanced_and_prompt_is_neutral():
         assert len({path.replace("_Code.js", ".js") for path in paths}) == len(paths), \
             "both labels from one matched pair were selected"
         prompt = E.security_review_text("CWE-999/UnsafeThing_Code.js", "const x = 1;")
-        assert "safe or vulnerable" in prompt
-        assert "do not invent" in prompt
+        # The template hard-wraps, so "do not\ninvent" is one phrase split across
+        # two lines. Match on normalised whitespace or the assertion breaks every
+        # time someone re-flows a paragraph.
+        flat = " ".join(prompt.split())
+        assert "safe or vulnerable" in flat
+        assert "do not invent" in flat
         assert "CWE-999" not in prompt and "UnsafeThing" not in prompt and "_Code" not in prompt
         assert "File: review_target.js" in prompt
         assert prompt == E.VERDICT_PROMPT.format(

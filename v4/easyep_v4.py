@@ -211,7 +211,10 @@ class Profiler:
             "gate_topk": self.gate_topk,
             "accumulation_mode": ACCUMULATION_MODE,
             "deterministic_score_reductions": self.deterministic_reductions is True,
-            "torch_version": torch.__version__,
+            # str(): torch.__version__ is a TorchVersion instance, and the
+            # weights_only unpickler rejects it as an unsupported global,
+            # which made every artifact this wrote unloadable.
+            "torch_version": str(torch.__version__),
             "norm_error_samples_per_layer": list(self._err_n_by_layer),
         }
         if (n_hash_layers is None) != (model_identity is None):
@@ -1160,7 +1163,7 @@ def cmd_profile(a) -> None:
 
 def cmd_mask(a) -> None:
     st = _require_score_artifact(
-        torch.load(a.scores, map_location="cpu"), a.scores,
+        torch.load(a.scores, map_location="cpu", weights_only=True), a.scores,
         n_hash_layers=a.n_hash_layers)
     key = ("gate_sums" if a.gating_score else
            "score_no_simibr" if a.no_simibr else "score")
@@ -2252,7 +2255,7 @@ def cmd_pairs(a) -> None:
             print(f"[easyep] {m}", flush=True)
 
     st = _require_score_artifact(
-        torch.load(a.scores_in, map_location="cpu"), a.scores_in,
+        torch.load(a.scores_in, map_location="cpu", weights_only=True), a.scores_in,
         n_hash_layers=args.n_hash_layers, model_identity=model_identity)
     expected = (args.n_layers, args.n_routed_experts)
     if tuple(st["score"].shape) != expected:
@@ -2923,7 +2926,7 @@ def cmd_pipeline(a) -> None:
         # reductions and exact calibration-token hashes; all masks are rebuilt
         # here from one consistent set of statistics.
         st = _require_score_artifact(
-            torch.load(a.scores_in, map_location="cpu"), a.scores_in,
+            torch.load(a.scores_in, map_location="cpu", weights_only=True), a.scores_in,
             n_hash_layers=args.n_hash_layers, model_identity=model_identity)
         expected = (args.n_layers, args.n_routed_experts)
         if tuple(st["score"].shape) != expected:
