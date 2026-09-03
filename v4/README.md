@@ -278,21 +278,30 @@ The main environment overrides are:
 | `SEED` | `965` | calibration ordering, controls, and paired decoding seed |
 | `TEMPERATURE` | unset | keep the model default (`1.0`); set `0` for greedy decoding |
 | `RUN_ID` | Slurm job id | suffix of the unique output directory |
-| `RESUME` | `0` | `1` reattaches to an existing `run_RUN_ID` and skips stages that completed, after checking the parameters still match |
+| `RESUME` | `0` | `1` reattaches only when the complete immutable provenance and every skipped stage checkpoint still match |
 | `STRICT_PINS` | `0` | `1` aborts when the active environment does not match `requirements-v4.txt` exactly; otherwise divergences are logged |
 | `MASTER_PORT_BASE` | job-derived | first of the per-stage rendezvous ports |
 | `PYTHON_MODULE` | `python` | module used to create and run the V4 virtual environment |
 | `CUDA_MODULE` | `cuda/13.2` | CUDA module loaded in the job |
 
-A stage that exits zero records a sentinel under `run_RUN_ID/.stages/`, so a job
-lost to the walltime can be resubmitted with the same `RUN_ID` and `RESUME=1`
-to continue from the last completed stage rather than re-profiling. Resuming
-aborts if the run parameters changed. Without `RESUME=1` the launcher refuses
-to overwrite an existing `run_RUN_ID` directory and, for a
-Git checkout, refuses tracked or staged changes. Its compact `RUN_MANIFEST.json`
-content-hashes the executing EASY-EP files, official inference/encoding trees,
-configuration, tokenizers, questions, pair manifest, and complete input data
-tree. The required checkpoint provenance sidecar records full SHA-256 hashes for
+A stage that exits zero atomically records a JSON checkpoint under
+`run_RUN_ID/.stages/`. Each checkpoint binds the immutable run-provenance hash,
+exact stage command, direct upstream artifacts, and complete output trees. A
+resume rehashes all of them before skipping; an empty legacy marker, missing or
+modified artifact, changed command, or changed upstream stage aborts instead of
+splicing results. A per-`RUN_ID` lock rejects overlapping submissions.
+
+The first launch publishes the immutable `RUN_MANIFEST.json` once.
+On resume, the launcher builds a candidate in memory and requires exact equality
+across source, model, environment, parameters, and input data. The original
+manifest is never rewritten; attempt and completion data live in
+`RUN_STATUS.json`. Schema-v2 manifests and empty legacy markers are
+intentionally not resumable; use a new `RUN_ID`. Without `RESUME=1` the launcher
+refuses to overwrite an existing output directory and, for a Git checkout,
+refuses tracked or staged changes. The compact provenance record content-hashes
+the executing EASY-EP files, official inference/encoding trees, configuration,
+tokenizers, questions, pair manifest, and complete input data tree. The required
+checkpoint provenance sidecar records full SHA-256 hashes for
 every converted shard, the pinned commit recorded by the Hugging Face local-dir
 metadata, and content-derived identifiers for the critical upstream source
 files. Each job verifies its model/revision declarations, exact shard metadata,
@@ -307,7 +316,8 @@ Outputs are grouped under `$EASYEP_RESULTS_ROOT/run_RUN_ID/`:
 
 | path | contents |
 |---|---|
-| `RUN_MANIFEST.json` | provenance, parameters, status, completed stages, and artifact paths |
+| `RUN_MANIFEST.json` | immutable provenance and its canonical hash; written exactly once |
+| `RUN_STATUS.json` | mutable attempt history, exit status, completed stages, and artifact paths |
 | `parity/parity.json` | instrumentation parity gate report |
 | `norm_validation/norm_validation.json` | recovered-vs-explicit norm gate report |
 | `norm_validation/validation_scores.pt` | validation score tensors |
@@ -355,6 +365,15 @@ is doing work.
 Schema-v1 overlap numbers are not comparable to the mHC-aware primary score and
 must be regenerated from a schema-v2 run.
 
+Calibration uses a near-equal, seeded sample of manifest-labelled vulnerable and
+secure files, never both sides of one matched pair. Both labels receive the same
+outcome-neutral `VULNERABLE or SAFE` prompt and a neutral display path, so CWE,
+GHSA, `Unsafe*`, and `_Code` names cannot steer routing. The prompt requires
+concrete evidence without assuming either outcome and treats delimited source as
+data rather than instructions. Calibration and matched-pair evaluation share
+this exact prompt because generated calibration responses are included in the
+profiled trajectory.
+
 Matched-pair selection excludes every source file selected for calibration, so
 the discrimination evaluation cannot reuse a profiled program. The selected
 paths and their content/token identities are persisted in `pairs_used.json`.
@@ -365,7 +384,7 @@ sample texts, whose synthetic names match nothing in the corpus and would make
 the exclusion silently vacuous, or one profiled without the security-review
 prompt, whose routing statistics come from a different distribution. The same
 applies across thinking modes: every prompt this pipeline encodes goes through
-the single `THINKING_MODE` constant (currently `reasoning`), and an artifact
+the single `THINKING_MODE` constant (currently `thinking`), and an artifact
 profiled under a different mode is refused rather than silently reused, because
 the mode changes what the model emits and therefore which experts route.
 
@@ -384,18 +403,20 @@ frequency, and random controls.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 59 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 62 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask
 construction and partitioning, hash-layer protection, the gating-score,
 frequency, and random baselines, schema rejection, deterministic score-reduction
-state restoration, cutoff-margin reporting, seeded calibration sampling,
+state restoration, cutoff-margin reporting, balanced seeded calibration sampling,
 token-exact chunking,
 prompt-plus-response profiling, the discrimination metric (including that a
 constant "VULNERABLE" answerer scores J=0), label-neutral paired inputs,
-calibration/matched-pair disjointness, path-traversal rejection, portable
-checkpoint provenance and full-hash verification, parity-threshold validation,
+calibration/matched-pair disjointness, neutral prompt/path construction,
+path-traversal rejection, immutable resume comparison, content-bound stage
+checkpoint tamper detection, portable checkpoint provenance and full-hash
+verification, parity-threshold validation,
 blinding (including that the matched-pair label is withheld), that no evaluation
 prompt carries the reference answer or grading rubric, the context-window
 ceiling, the checkpoint allowlist, and the inlined `hc_post` algebra used by

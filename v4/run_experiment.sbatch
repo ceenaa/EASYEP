@@ -175,6 +175,7 @@ require_file "$CONFIG"
 require_file "$REPO/v4/easyep.sbatch"
 require_file "$REPO/v4/requirements-v4.txt"
 require_file "$REPO/v4/checkpoint_provenance.py"
+require_file "$REPO/v4/run_provenance.py"
 require_dir "$CODE"
 CODE=$(cd -P "$CODE" && pwd -P)
 SOURCE_SNAPSHOT=$(cd -P "$CODE/.." && pwd -P)
@@ -225,6 +226,7 @@ module load "$PYTHON_MODULE" "$CUDA_MODULE"
 # Not fatal by default: site wheelhouse builds (e.g. 2.13.0+cc) are legitimate
 # and intended. Set STRICT_PINS=1 to require an exact match.
 STRICT_PINS=${STRICT_PINS:-0}
+export STRICT_PINS
 if ! "$VENV/bin/python" - "$REPO/v4/requirements-v4.txt" "$STRICT_PINS" <<'PYPIN'; then
 import importlib.metadata as md, re, sys
 requirements, strict = sys.argv[1], sys.argv[2] == "1"
@@ -298,229 +300,76 @@ require_uint MASTER_PORT_BASE "$MASTER_PORT_BASE" 1024 65527
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 
 mkdir -p "$RESULTS_ROOT"
+# Hold one advisory lock for the lifetime of the job. Duplicate resubmissions of
+# the same RUN_ID must never write the same manifest or artifact directories.
+command -v flock >/dev/null || {
+  echo "ABORT: flock is required for exclusive run ownership." >&2
+  exit 2
+}
+exec {RUN_LOCK_FD}>"$RESULTS_ROOT/.run_${run_id}.lock"
+if ! flock -n "$RUN_LOCK_FD"; then
+  echo "ABORT: another job already owns RUN_ID=$run_id." >&2
+  exit 2
+fi
+ATTEMPT_STARTED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # RESUME=1 reattaches to an existing run directory and skips stages that already
-# recorded a completion sentinel. Without it the launcher still refuses to touch
+# recorded a verified completion checkpoint. Without it the launcher refuses to touch
 # an existing directory, so a resume is always a deliberate act.
 RESUME=${RESUME:-0}
-if [[ $RESUME == 1 && -d $OUT ]]; then
+if [[ $RESUME != 0 && $RESUME != 1 ]]; then
+  echo "ABORT: RESUME must be 0 or 1." >&2
+  exit 2
+fi
+if [[ $RESUME == 1 ]]; then
+  require_dir "$OUT"
   # A run that died before stage setup has no .stages; that means nothing
   # completed, not that the resume is invalid, so create it and re-run all.
   mkdir -p "$OUT/.stages"
   require_file "$OUT/RUN_MANIFEST.json"
-  # Stages already on disk were produced under the earlier parameters. Resuming
-  # with different ones would silently splice incompatible halves together.
-  if ! "$VENV/bin/python" - "$OUT/RUN_MANIFEST.json" \
-      "$KEEP" "$N_CALIB" "$N_PAIRS" "$MAX_SEQ_LEN" "$MAX_NEW_TOKENS" \
-      "$PAIR_MAX_NEW_TOKENS" "$MAX_CHUNKS" "$SEED" "$LIMIT" "$TEMPERATURE" <<'PYRESUME'; then
-import json, sys
-manifest, argv = json.loads(open(sys.argv[1], encoding="utf-8").read()), sys.argv[2:]
-names = ("keep", "n_calib", "n_pairs", "max_seq_len", "max_new_tokens",
-         "pair_max_new_tokens", "max_chunks", "seed", "question_limit")
-previous = manifest.get("parameters", {})
-changed = []
-for name, value in zip(names, argv):
-    if previous.get(name) != int(value):
-        changed.append(f"{name}: was {previous.get(name)!r}, now {int(value)}")
-wanted = None if argv[9] == "" else float(argv[9])
-if previous.get("temperature") != wanted:
-    changed.append(f"temperature: was {previous.get('temperature')!r}, now {wanted!r}")
-for line in changed:
-    print(f"  RESUME MISMATCH  {line}")
-sys.exit(1 if changed else 0)
-PYRESUME
-    echo "ABORT: RESUME=1 but the parameters differ from the existing run." >&2
-    echo "       Use a new RUN_ID instead of splicing incompatible stages." >&2
-    exit 2
-  fi
-  echo "RESUME: reattaching to $OUT; completed stages will be skipped."
+  echo "RESUME: validating all immutable provenance before reattaching to $OUT."
 elif ! mkdir "$OUT"; then
   echo "ABORT: output already exists or could not be created (choose a new RUN_ID," \
        "or resubmit the same RUN_ID with RESUME=1): $OUT" >&2
   exit 2
 fi
 
-# Write valid JSON with compact provenance. Code and input-tree digests commit to
-# every relative path and byte without expanding thousands of per-file records.
-# Checkpoint shards use a separately verified, full-content provenance record so
-# jobs do not reread hundreds of GB at every launch.
-"$VENV/bin/python" - \
-  "$OUT/RUN_MANIFEST.json" "$REPO" "$SCRIPT" "${BASH_SOURCE[0]}" \
-  "$CONFIG" "$CODE" "$CKPT" "$CHECKPOINT_PROVENANCE" "$DATA_ROOT" "$VENV" \
-  "$GIT_SHA" "$GIT_TRACKED_DIRTY" \
-  "$MODEL_ID" "$MODEL_REVISION" "$INFERENCE_REVISION" \
-  "$KEEP" "$N_CALIB" "$N_PAIRS" "$MAX_SEQ_LEN" "$MAX_NEW_TOKENS" \
-  "$PAIR_MAX_NEW_TOKENS" "$MAX_CHUNKS" "$SEED" "$TEMPERATURE" "$LIMIT" \
-  "$NPROC_PER_NODE" <<'PY'
-import datetime
-import hashlib
-import importlib.metadata
-import json
-import os
-from pathlib import Path
-import platform
-import re
-import sys
-
-(
-    manifest_path, repo, script, entrypoint, config, code, ckpt,
-    checkpoint_provenance, data_root, venv,
-    git_sha, git_tracked_dirty, model_id, model_revision,
-    inference_revision, keep, n_calib, n_pairs, max_seq_len, max_new_tokens,
-    pair_max_new_tokens, max_chunks, seed, temperature, question_limit, nproc,
-) = sys.argv[1:]
-
-def digest(path, capture=False):
-    path = Path(path)
-    before = path.stat()
-    identity = lambda stat: (
-        stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
-    )
-    h = hashlib.sha256()
-    payload = bytearray() if capture else None
-    with path.open("rb") as fp:
-        if identity(os.fstat(fp.fileno())) != identity(before):
-            raise RuntimeError(f"file changed while opening for hashing: {path}")
-        for block in iter(lambda: fp.read(16 * 1024 * 1024), b""):
-            h.update(block)
-            if payload is not None:
-                payload.extend(block)
-        finished = os.fstat(fp.fileno())
-    after = path.stat()
-    if identity(before) != identity(finished) or identity(before) != identity(after):
-        raise RuntimeError(f"file changed while hashing: {path}")
-    record = {"path": str(path.resolve()), "size": finished.st_size,
-              "sha256": h.hexdigest()}
-    return (record, bytes(payload)) if payload is not None else record
-
-def tree_digest(root):
-    root = Path(root)
-    aggregate = hashlib.sha256()
-    count = total = 0
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        item = digest(path)
-        relative = str(path.relative_to(root))
-        aggregate.update(relative.encode("utf-8") + b"\0")
-        aggregate.update(item["sha256"].encode("ascii") + b"\n")
-        count += 1
-        total += item["size"]
-    return {"root": str(root.resolve()), "file_count": count,
-            "total_bytes": total, "tree_sha256": aggregate.hexdigest()}
-
-def metadata(path):
-    path = Path(path)
-    stat = path.stat()
-    return {"path": str(path.resolve()), "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns}
-
-def layout_digest(paths):
-    records = [metadata(path) for path in sorted(paths)]
-    encoded = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
-    return {"files": records, "layout_sha256": hashlib.sha256(encoded).hexdigest()}
-
-repo, code, ckpt, data_root = (
-    Path(value).resolve() for value in (repo, code, ckpt, data_root)
-)
-runtime_paths = [
-    Path(script), Path(entrypoint), Path(config), repo / "v4/easyep.sbatch",
-    repo / "v4/requirements-v4.txt", repo / "v4/checkpoint_provenance.py",
-    Path(checkpoint_provenance), ckpt / "tokenizer.json",
-    ckpt / "tokenizer_config.json",
-]
-packages = {}
-for name in ("torch", "transformers", "safetensors", "tilelang",
-             "fast-hadamard-transform"):
-    try:
-        packages[name] = importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        packages[name] = None
-
-checkpoint_sidecar_digest, checkpoint_sidecar_bytes = digest(
-    checkpoint_provenance, capture=True)
-checkpoint_record = json.loads(checkpoint_sidecar_bytes)
-checkpoint_content_identity = checkpoint_record.get("content_identity_sha256")
-if (not isinstance(checkpoint_content_identity, str)
-        or re.fullmatch(r"[0-9a-f]{64}", checkpoint_content_identity) is None):
-    raise RuntimeError("verified checkpoint sidecar lacks a portable content identity")
-
-manifest = {
-    "schema_version": 2,
-    "status": "running",
-    "slurm": {"job_id": os.environ.get("SLURM_JOB_ID", "manual"),
-              "array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
-              "node": platform.node()},
-    "started_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "source": {"git_sha": git_sha, "git_tracked_dirty": git_tracked_dirty,
-               "runtime_files": [
-                   checkpoint_sidecar_digest
-                   if Path(path).resolve() == Path(checkpoint_provenance).resolve()
-                   else digest(path)
-                   for path in runtime_paths
-               ],
-               "official_inference_tree": tree_digest(code),
-               "official_encoding_tree": tree_digest(code.parent / "encoding")},
-    "model": {"declared_id": model_id, "declared_revision": model_revision,
-              "declared_inference_revision": inference_revision,
-              "checkpoint_root": str(ckpt.resolve()),
-              "checkpoint_content_identity_sha256": checkpoint_content_identity,
-              "checkpoint_provenance": checkpoint_sidecar_digest,
-              "checkpoint_layout": layout_digest(
-                  ckpt.glob(f"model*-mp{nproc}.safetensors"))},
-    "inputs": {
-        "questions": digest(data_root / "questions_used.json"),
-        "pair_manifest": digest(data_root / "vulnerable-js-files/CODEQL_SECURE_MANIFEST.jsonl"),
-        "calibration_and_pair_tree": tree_digest(data_root / "vulnerable-js-files"),
-    },
-    "environment": {"python": sys.version, "platform": platform.platform(),
-                    "packages": packages,
-                    "python_module": os.environ.get("PYTHON_MODULE"),
-                    "cuda_module": os.environ.get("CUDA_MODULE"),
-                    "loaded_modules": os.environ.get("LOADEDMODULES", "").split(":"),
-                    "venv": str(Path(venv).resolve())},
-    "parameters": {"keep": int(keep), "n_calib": int(n_calib),
-                   "n_pairs": int(n_pairs), "max_seq_len": int(max_seq_len),
-                   "max_new_tokens": int(max_new_tokens),
-                   "pair_max_new_tokens": int(pair_max_new_tokens),
-                   "validate_n_calib": int(n_calib), "max_chunks": int(max_chunks),
-                   "question_limit": int(question_limit),
-                   "seed": int(seed),
-                   "temperature": None if temperature == "" else float(temperature),
-                   "nproc_per_node": int(nproc)},
-}
-Path(manifest_path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-print(f"manifest initialized: {manifest_path}")
-PY
+# Build the current immutable record in memory. On resume the helper requires an
+# exact match and leaves the old record untouched; on a new run it publishes the
+# record atomically. Volatile attempt/status fields live outside provenance.
+MANIFEST_ARGS=(init --manifest "$OUT/RUN_MANIFEST.json" --repo "$REPO"
+  --script "$SCRIPT" --entrypoint "${BASH_SOURCE[0]}" --config "$CONFIG"
+  --code "$CODE" --checkpoint "$CKPT"
+  --checkpoint-provenance "$CHECKPOINT_PROVENANCE" --data-root "$DATA_ROOT"
+  --venv "$VENV" --git-sha "$GIT_SHA" --git-tracked-dirty "$GIT_TRACKED_DIRTY"
+  --model-id "$MODEL_ID" --model-revision "$MODEL_REVISION"
+  --inference-revision "$INFERENCE_REVISION" --keep "$KEEP" --n-calib "$N_CALIB"
+  --n-pairs "$N_PAIRS" --max-seq-len "$MAX_SEQ_LEN"
+  --max-new-tokens "$MAX_NEW_TOKENS" --pair-max-new-tokens "$PAIR_MAX_NEW_TOKENS"
+  --max-chunks "$MAX_CHUNKS" --question-limit "$LIMIT" --seed "$SEED"
+  --nproc-per-node "$NPROC_PER_NODE" --attempt-started-utc "$ATTEMPT_STARTED_UTC")
+[[ -z $TEMPERATURE ]] || MANIFEST_ARGS+=(--temperature "$TEMPERATURE")
+[[ $RESUME == 1 ]] && MANIFEST_ARGS+=(--resume)
+"$VENV/bin/python" "$REPO/v4/run_provenance.py" "${MANIFEST_ARGS[@]}"
 
 STAGES_COMPLETED=()
 finalize_manifest() {
   local rc=$?
   trap - EXIT
   set +e
-  local stages
-  stages=$(IFS=,; printf '%s' "${STAGES_COMPLETED[*]:-}")
-  "$VENV/bin/python" - "$OUT/RUN_MANIFEST.json" "$OUT" "$rc" "$stages" <<'PY'
-import datetime
-import json
-from pathlib import Path
-import sys
-
-manifest_path, out_dir, return_code, stages = sys.argv[1:]
-path = Path(manifest_path)
-if path.is_file():
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    manifest.update({
-        "status": "complete" if int(return_code) == 0 else "failed",
-        "exit_code": int(return_code),
-        "finished_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "stages_completed": [stage for stage in stages.split(",") if stage],
-        "artifacts": sorted(str(item.relative_to(out_dir)) for item in
-                            Path(out_dir).rglob("*") if item.is_file() and item != path),
-    })
-    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-PY
-  local manifest_rc=$?
-  if (( rc == 0 && manifest_rc != 0 )); then
-    echo "ABORT: run succeeded but manifest finalization failed." >&2
-    rc=$manifest_rc
+  local finalize_args=(finalize --manifest "$OUT/RUN_MANIFEST.json"
+    --status "$OUT/RUN_STATUS.json"
+    --out-dir "$OUT" --return-code "$rc"
+    --attempt-started-utc "$ATTEMPT_STARTED_UTC")
+  [[ $RESUME == 1 ]] && finalize_args+=(--resumed)
+  local stage
+  for stage in "${STAGES_COMPLETED[@]:-}"; do
+    [[ -z $stage ]] || finalize_args+=(--stage "$stage")
+  done
+  "$VENV/bin/python" "$REPO/v4/run_provenance.py" "${finalize_args[@]}"
+  local status_rc=$?
+  if (( rc == 0 && status_rc != 0 )); then
+    echo "ABORT: run succeeded but status finalization failed." >&2
+    rc=$status_rc
   fi
   exit "$rc"
 }
@@ -535,75 +384,8 @@ preflight_integrity() {
     --config "$CONFIG" --source-snapshot "$SOURCE_SNAPSHOT" \
     --model-id "$MODEL_ID" --model-revision "$MODEL_REVISION" \
     --inference-revision "$INFERENCE_REVISION" --nproc "$NPROC_PER_NODE"
-  "$VENV/bin/python" - "$OUT/RUN_MANIFEST.json" <<'PY'
-import hashlib
-import json
-import os
-from pathlib import Path
-import sys
-
-def digest(path, capture=False):
-    path = Path(path)
-    before = path.stat()
-    identity = lambda stat: (
-        stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
-    )
-    h = hashlib.sha256()
-    payload = bytearray() if capture else None
-    with path.open("rb") as fp:
-        if identity(os.fstat(fp.fileno())) != identity(before):
-            raise RuntimeError(f"file changed while opening for hashing: {path}")
-        for block in iter(lambda: fp.read(16 * 1024 * 1024), b""):
-            h.update(block)
-            if payload is not None:
-                payload.extend(block)
-        finished = os.fstat(fp.fileno())
-    after = path.stat()
-    if identity(before) != identity(finished) or identity(before) != identity(after):
-        raise RuntimeError(f"file changed while hashing: {path}")
-    record = {"path": str(path.resolve()), "size": finished.st_size,
-              "sha256": h.hexdigest()}
-    return (record, bytes(payload)) if payload is not None else record
-
-def tree_digest(root):
-    root = Path(root)
-    aggregate = hashlib.sha256()
-    count = total = 0
-    for path in sorted(path for path in root.rglob("*") if path.is_file()):
-        item = digest(path)
-        relative = str(path.relative_to(root))
-        aggregate.update(relative.encode("utf-8") + b"\0")
-        aggregate.update(item["sha256"].encode("ascii") + b"\n")
-        count += 1
-        total += item["size"]
-    return {"root": str(root.resolve()), "file_count": count,
-            "total_bytes": total, "tree_sha256": aggregate.hexdigest()}
-
-manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-for expected in manifest["source"]["runtime_files"]:
-    if digest(expected["path"]) != expected:
-        raise RuntimeError(f"runtime file changed after manifest creation: {expected['path']}")
-for key in ("official_inference_tree", "official_encoding_tree"):
-    expected = manifest["source"][key]
-    if tree_digest(expected["root"]) != expected:
-        raise RuntimeError(f"official source tree changed after manifest creation: {key}")
-for key in ("questions", "pair_manifest"):
-    expected = manifest["inputs"][key]
-    if digest(expected["path"]) != expected:
-        raise RuntimeError(f"experiment input changed after manifest creation: {key}")
-expected_tree = manifest["inputs"]["calibration_and_pair_tree"]
-if tree_digest(expected_tree["root"]) != expected_tree:
-    raise RuntimeError("calibration/pair input tree changed after manifest creation")
-sidecar_expected = manifest["model"]["checkpoint_provenance"]
-sidecar_digest, sidecar_bytes = digest(sidecar_expected["path"], capture=True)
-if sidecar_digest != sidecar_expected:
-    raise RuntimeError("checkpoint provenance sidecar changed after manifest creation")
-sidecar = json.loads(sidecar_bytes)
-if sidecar.get("content_identity_sha256") != manifest["model"].get(
-        "checkpoint_content_identity_sha256"):
-    raise RuntimeError("checkpoint content identity changed after manifest creation")
-print("run inputs still match RUN_MANIFEST.json")
-PY
+  "$VENV/bin/python" "$REPO/v4/run_provenance.py" preflight \
+    --manifest "$OUT/RUN_MANIFEST.json" --entrypoint "${BASH_SOURCE[0]}"
 }
 
 echo "================================================================"
@@ -618,33 +400,83 @@ echo " out        $OUT"
 echo "================================================================"
 
 stage_index=0
-# A stage is complete only if it exited zero; the sentinel is written after the
-# subshell returns, so a killed or failed stage is always re-run.
+# A stage is complete only if its atomic JSON marker still authenticates the
+# immutable run provenance, exact command, direct inputs, and complete outputs.
 mkdir -p "$OUT/.stages"
 stage_done() { [[ -f "$OUT/.stages/$1.done" ]]; }
-mark_done() { : > "$OUT/.stages/$1.done"; }
 
-run_stage() {                  # run_stage <name> <mode> <args...>
+stage_record_args() {          # stage_record_args <name> <output> <inputs...> -- <command...>
   local stage=$1
+  local output=$2
+  shift 2
+  STAGE_RECORD_ARGS=(--manifest "$OUT/RUN_MANIFEST.json"
+    --marker "$OUT/.stages/$stage.done" --stage "$stage")
+  while [[ $1 != -- ]]; do
+    STAGE_RECORD_ARGS+=(--input="$1")
+    shift
+  done
   shift
+  local arg
+  for arg in "$@"; do
+    STAGE_RECORD_ARGS+=(--command-arg="$arg")
+  done
+  STAGE_RECORD_ARGS+=(--output="$output")
+}
+
+run_stage() {                  # run_stage <name> <output> <inputs...> -- <mode> <args...>
+  local stage=$1 output=$2
+  shift 2
+  local inputs=()
+  while [[ $1 != -- ]]; do
+    inputs+=("$1")
+    shift
+  done
+  shift
+  local command=("$@")
   local port=$((MASTER_PORT_BASE + stage_index))
   stage_index=$((stage_index + 1))
+  stage_record_args "$stage" "$output" "${inputs[@]}" -- \
+    torchrun "$NPROC_PER_NODE" "$SCRIPT" "${command[@]}"
+  # This check happens before marker verification, including for skipped stages.
+  # It therefore compares current bytes to the original immutable provenance.
+  preflight_integrity
   if [[ $RESUME == 1 ]] && stage_done "$stage"; then
+    "$VENV/bin/python" "$REPO/v4/run_provenance.py" verify-stage \
+      "${STAGE_RECORD_ARGS[@]}"
     echo
-    echo "---------- stage: $stage  SKIPPED (already completed) ----------"
+    echo "---------- stage: $stage  SKIPPED (inputs and outputs verified) ----------"
     STAGES_COMPLETED+=("$stage")
     return 0
   fi
   echo
   echo "---------- stage: $stage (master $MASTER_ADDR:$port) ----------"
-  preflight_integrity
   (
     cd "$CODE"
     "$VENV/bin/torchrun" --nnodes=1 --nproc-per-node="$NPROC_PER_NODE" \
       --master-addr="$MASTER_ADDR" --master-port="$port" \
-      "$SCRIPT" "$@"
+      "$SCRIPT" "${command[@]}"
   )
-  mark_done "$stage"
+  "$VENV/bin/python" "$REPO/v4/run_provenance.py" mark-stage \
+    "${STAGE_RECORD_ARGS[@]}"
+  STAGES_COMPLETED+=("$stage")
+}
+
+run_local_stage() {            # same checkpoint contract for non-torchrun stages
+  local stage=$1 output=$2 input=$3
+  shift 3
+  local command=("$@")
+  stage_record_args "$stage" "$output" "$input" -- "${command[@]}"
+  preflight_integrity
+  if [[ $RESUME == 1 ]] && stage_done "$stage"; then
+    "$VENV/bin/python" "$REPO/v4/run_provenance.py" verify-stage \
+      "${STAGE_RECORD_ARGS[@]}"
+    echo "---------- stage: $stage  SKIPPED (inputs and outputs verified) ----------"
+  else
+    echo "---------- stage: $stage ----------"
+    "${command[@]}"
+    "$VENV/bin/python" "$REPO/v4/run_provenance.py" mark-stage \
+      "${STAGE_RECORD_ARGS[@]}"
+  fi
   STAGES_COMPLETED+=("$stage")
 }
 
@@ -654,8 +486,8 @@ TEMPERATURE_ARGS=()
 [[ -z $TEMPERATURE ]] || TEMPERATURE_ARGS=(--temperature "$TEMPERATURE")
 
 # Both correctness gates are mandatory and stop the job on failure.
-run_stage parity parity "${COMMON[@]}" --out "$OUT/parity"
-run_stage validate validate "${COMMON[@]}" \
+run_stage parity "$OUT/parity" -- parity "${COMMON[@]}" --out "$OUT/parity"
+run_stage validate "$OUT/norm_validation" "$OUT/parity" -- validate "${COMMON[@]}" \
   "${TEMPERATURE_ARGS[@]}" \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
   --out "$OUT/norm_validation" --n-calib "$N_CALIB" --keep "$KEEP" \
@@ -663,14 +495,16 @@ run_stage validate validate "${COMMON[@]}" \
   --seed "$SEED"
 
 # Profile once and reuse exactly that score tensor for both evaluation suites.
-run_stage profile pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
+run_stage profile "$OUT/scores" "$OUT/parity" "$OUT/norm_validation" -- \
+  pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
   --questions "$DATA_ROOT/questions_used.json" \
   --out "$OUT/scores" --n-calib "$N_CALIB" --keep "$KEEP" \
   --max-new-tokens "$MAX_NEW_TOKENS" --max-chunks "$MAX_CHUNKS" \
   --seed "$SEED" --profile-only
 
-run_stage eval pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
+run_stage eval "$OUT/questions" "$OUT/scores/expert_scores.pt" -- \
+  pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
   --questions "$DATA_ROOT/questions_used.json" \
   --scores-in "$OUT/scores/expert_scores.pt" \
@@ -678,33 +512,22 @@ run_stage eval pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --limit "$LIMIT" \
   --max-new-tokens "$MAX_NEW_TOKENS"
 
-run_stage pairs pairs "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
+run_stage pairs "$OUT/pairs" "$OUT/scores/expert_scores.pt" -- \
+  pairs "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --scores-in "$OUT/scores/expert_scores.pt" \
   --pairs-manifest "$DATA_ROOT/vulnerable-js-files/CODEQL_SECURE_MANIFEST.jsonl" \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
   --out "$OUT/pairs" --n-pairs "$N_PAIRS" --keep "$KEEP" --seed "$SEED" \
   --max-new-tokens "$PAIR_MAX_NEW_TOKENS"
 
-preflight_integrity
 # Re-running blind draws a fresh label assignment, which would invalidate the
-# key any in-flight grading is holding, so a resumed run must skip a bundle
-# it already produced. (cmd_blind itself overwrites without complaint.)
-if [[ $RESUME == 1 ]] && stage_done blind_questions; then
-  echo "---------- stage: blind_questions  SKIPPED (already completed) ----------"
-else
+# key any in-flight grading is holding. Content-bound markers make skipping safe.
+run_local_stage blind_questions "$OUT/judge/questions" "$OUT/questions" \
   "$VENV/bin/python" "$SCRIPT" blind --results "$OUT/questions" \
-    --questions "$DATA_ROOT/questions_used.json" --out "$OUT/judge/questions"
-  mark_done blind_questions
-fi
-STAGES_COMPLETED+=(blind_questions)
-if [[ $RESUME == 1 ]] && stage_done blind_pairs; then
-  echo "---------- stage: blind_pairs  SKIPPED (already completed) ----------"
-else
+  --questions "$DATA_ROOT/questions_used.json" --out "$OUT/judge/questions"
+run_local_stage blind_pairs "$OUT/judge/pairs" "$OUT/pairs" \
   "$VENV/bin/python" "$SCRIPT" blind --results "$OUT/pairs" --pairs \
-    --out "$OUT/judge/pairs"
-  mark_done blind_pairs
-fi
-STAGES_COMPLETED+=(blind_pairs)
+  --out "$OUT/judge/pairs"
 
 echo
 echo "================================================================"

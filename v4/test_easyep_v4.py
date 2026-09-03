@@ -34,6 +34,10 @@ provenance_spec = importlib.util.spec_from_file_location(
     "checkpoint_provenance", HERE / "checkpoint_provenance.py")
 C = importlib.util.module_from_spec(provenance_spec)
 provenance_spec.loader.exec_module(C)
+run_provenance_spec = importlib.util.spec_from_file_location(
+    "run_provenance", HERE / "run_provenance.py")
+R = importlib.util.module_from_spec(run_provenance_spec)
+run_provenance_spec.loader.exec_module(R)
 
 PASS, FAIL = [], []
 
@@ -1716,6 +1720,40 @@ def t_calibration_sampling_is_stratified_and_stable():
         assert max(per.values()) - min(per.values()) <= 1, f"unbalanced: {per}"
 
 
+def t_calibration_manifest_sampling_is_balanced_and_prompt_is_neutral():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "vulnerable-js-files"
+        rows = []
+        for i in range(8):
+            cwe = root / f"CWE-{i:03d}"
+            cwe.mkdir(parents=True)
+            vulnerable = cwe / f"unsafe-{i}.js"
+            secure = cwe / f"unsafe-{i}_Code.js"
+            vulnerable.write_text(f"dangerous(user{i});\n")
+            secure.write_text(f"safe(user{i});\n")
+            rows.append({
+                "original_file": f"vulnerable-js-files/{cwe.name}/{vulnerable.name}",
+                "secure_file": f"vulnerable-js-files/{cwe.name}/{secure.name}",
+                "original_sha256": hashlib.sha256(vulnerable.read_bytes()).hexdigest(),
+                "secure_sha256": hashlib.sha256(secure.read_bytes()).hexdigest(),
+                "alert_locations": 1,
+            })
+        (root / "CODEQL_SECURE_MANIFEST.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n")
+        selected = E.sample_calibration_files(root, 7, seed=965)
+        paths = [path for path, _ in selected]
+        assert sum(path.endswith("_Code.js") for path in paths) in (3, 4)
+        assert len({path.replace("_Code.js", ".js") for path in paths}) == len(paths), \
+            "both labels from one matched pair were selected"
+        prompt = E.security_review_text("CWE-999/UnsafeThing_Code.js", "const x = 1;")
+        assert "safe or vulnerable" in prompt
+        assert "do not invent" in prompt
+        assert "CWE-999" not in prompt and "UnsafeThing" not in prompt and "_Code" not in prompt
+        assert "File: review_target.js" in prompt
+        assert prompt == E.VERDICT_PROMPT.format(
+            path="review_target.js", code="const x = 1;")
+
+
 def t_calibration_sampling_randomizes_strata_when_n_is_small():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1870,6 +1908,83 @@ def t_calibration_provenance_binds_inputs_responses_and_parameters():
     tampered["parameters"]["temperature"] = float("nan")
     must_raise(SystemExit, lambda: E._validate_calibration_provenance(tampered),
                "temperature")
+
+
+def t_resume_requires_complete_immutable_provenance_match():
+    provenance = {
+        "source": {"git_sha": "a" * 40},
+        "inputs": {"tree_sha256": "b" * 64},
+        "parameters": {"keep": 128},
+    }
+    existing = {
+        "schema_version": R.MANIFEST_SCHEMA_VERSION,
+        "provenance": provenance,
+        "provenance_sha256": R.canonical_sha256(provenance),
+        "status": "failed",
+    }
+    R.verify_resume(existing, json.loads(json.dumps(provenance)))
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "RUN_MANIFEST.json"
+        R.atomic_write_json(path, existing)
+        before = path.read_bytes()
+        R.initialize_or_verify_manifest(
+            path, json.loads(json.dumps(provenance)), resume=True,
+            attempt_started_utc="2099-01-01T00:00:00Z")
+        assert path.read_bytes() == before, "resume rewrote the old manifest"
+        status = Path(td) / "RUN_STATUS.json"
+        R.cmd_finalize(SimpleNamespace(
+            manifest=str(path), status=str(status), out_dir=td, return_code=0,
+            resumed=True, attempt_started_utc="2099-01-01T00:00:00Z",
+            stage=["profile"],
+        ))
+        assert path.read_bytes() == before, "finalization rewrote the old manifest"
+        status_record = json.loads(status.read_text())
+        assert status_record["run_provenance_sha256"] == existing["provenance_sha256"]
+        assert status_record["stages_completed"] == ["profile"]
+    changed = json.loads(json.dumps(provenance))
+    changed["inputs"]["tree_sha256"] = "c" * 64
+    must_raise(ValueError, lambda: R.verify_resume(existing, changed),
+               "inputs.tree_sha256")
+    corrupt = json.loads(json.dumps(existing))
+    corrupt["provenance"]["parameters"]["keep"] = 64
+    must_raise(ValueError, lambda: R.verify_resume(corrupt, provenance), "invalid")
+
+
+def t_stage_markers_bind_commands_inputs_and_outputs():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        provenance = {"source": {"git_sha": "a" * 40}}
+        manifest = root / "RUN_MANIFEST.json"
+        R.atomic_write_json(manifest, {
+            "schema_version": R.MANIFEST_SCHEMA_VERSION,
+            "provenance": provenance,
+            "provenance_sha256": R.canonical_sha256(provenance),
+        })
+        dependency = root / "scores.pt"
+        dependency.write_bytes(b"scores-v1")
+        output = root / "questions"
+        output.mkdir()
+        answer = output / "answers.jsonl"
+        answer.write_text('{"answer":"SAFE"}\n')
+        marker = root / ".stages/eval.done"
+        args = SimpleNamespace(
+            manifest=str(manifest), marker=str(marker), stage="eval",
+            command_arg=["pipeline", "--scores-in", str(dependency)],
+            input=[str(dependency)], output=[str(output)],
+        )
+        R.cmd_mark_stage(args)
+        R.cmd_verify_stage(args)
+        record = json.loads(marker.read_text())
+        assert record["inputs"][0]["sha256"] == hashlib.sha256(b"scores-v1").hexdigest()
+        assert record["outputs"][0]["file_count"] == 1
+
+        dependency.write_bytes(b"scores-v2")
+        must_raise(ValueError, lambda: R.cmd_verify_stage(args), "inputs")
+        dependency.write_bytes(b"scores-v1")
+        answer.write_text('{"answer":"VULNERABLE"}\n')
+        must_raise(ValueError, lambda: R.cmd_verify_stage(args), "outputs")
+        answer.unlink()
+        must_raise(ValueError, lambda: R.cmd_verify_stage(args), "outputs")
 
 
 def main():
