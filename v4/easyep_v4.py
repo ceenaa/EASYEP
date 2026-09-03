@@ -3170,8 +3170,9 @@ def main() -> None:
     common(sp)
     sp.add_argument("--calib", required=True)
     sp.add_argument("--out", required=True)
-    sp.add_argument("--max-new-tokens", type=int, default=256,
-                    help="response tokens generated before profiling prompt+response")
+    sp.add_argument("--max-new-tokens", type=int, default=2048,
+                    help="response tokens generated before profiling prompt+response; "
+                         "default 2048 leaves room for reasoning plus the final answer")
     sp.add_argument("--max-chunks", type=int, default=0,
                     help="maximum token-exact chunks per sample; 0 is unlimited")
     sp.add_argument("--seed", type=int, default=965)
@@ -3198,7 +3199,8 @@ def main() -> None:
     sp.add_argument("--out", required=True,
                     help="output DIRECTORY; writes answers_<tag>.jsonl and "
                          "summary.json, the same layout the pipeline emits")
-    sp.add_argument("--max-new-tokens", type=int, default=256)
+    sp.add_argument("--max-new-tokens", type=int, default=2048,
+                    help="response-token limit; default 2048 avoids truncating reasoning-mode answers")
     sp.add_argument("--seed", type=int, default=965,
                     help="item i is decoded with manual_seed(seed+i)")
     sp.add_argument("--temperature", type=float, default=0.0,
@@ -3211,7 +3213,8 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=192)
-    sp.add_argument("--max-new-tokens", type=int, default=256)
+    sp.add_argument("--max-new-tokens", type=int, default=2048,
+                    help="response-token limit; default 2048 avoids truncating reasoning-mode answers")
     sp.add_argument("--scores-in", default="",
                     help="reuse expert_scores.pt from an earlier run; skips profiling "
                          "and rebuilds every mask from those statistics")
@@ -3236,7 +3239,8 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-pairs", type=int, default=25)
     sp.add_argument("--keep", type=int, default=128)
-    sp.add_argument("--max-new-tokens", type=int, default=128)
+    sp.add_argument("--max-new-tokens", type=int, default=1024,
+                    help="response-token limit; default 1024 leaves room for the short verdict format")
     sp.add_argument("--seed", type=int, default=965)
     sp.add_argument("--temperature", type=float, default=0.0,
                     help="decoding temperature; default 0 uses greedy decoding")
@@ -3265,7 +3269,8 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=128)
-    sp.add_argument("--max-new-tokens", type=int, default=256)
+    sp.add_argument("--max-new-tokens", type=int, default=2048,
+                    help="calibration response-token limit; default 2048 avoids truncation")
     sp.add_argument("--max-chunks", type=int, default=0,
                     help="maximum token-exact chunks per file; 0 is unlimited")
     sp.add_argument("--seed", type=int, default=965)
