@@ -2023,6 +2023,134 @@ def t_stage_markers_bind_commands_inputs_and_outputs():
         must_raise(ValueError, lambda: R.cmd_verify_stage(args), "outputs")
 
 
+class _Clock:
+    """Deterministic stand-in for the time module, so timing tests need no sleep."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def perf_counter(self):
+        return self.now
+
+    def time(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _timed_model(clock, prefill_seconds, decode_seconds):
+    class Model:
+        def forward(self, tokens, start_pos=0):
+            clock.advance(prefill_seconds() if start_pos == 0 else decode_seconds())
+            return ("out",)
+    return Model()
+
+
+def _ids(n):
+    return torch.zeros(1, n, dtype=torch.long)
+
+
+def t_forward_timer_separates_prefill_from_decode():
+    clock = _Clock()
+    model = _timed_model(clock, lambda: 2.0, lambda: 0.25)
+    saved, E.time = E.time, clock
+    try:
+        timer = E.ForwardTimer(warmup_items=0, warmup_steps=0, sync=False)
+        with timer.measure(model, "full", 0) as record:
+            model.forward(_ids(40), 0)
+            for step in range(4):
+                model.forward(_ids(1), 40 + step)
+        assert "forward" not in vars(model), "the patched forward was not removed"
+    finally:
+        E.time = saved
+    assert record["prefill_tokens"] == 40, record
+    assert abs(record["prefill_seconds"] - 2.0) < 1e-9, record
+    assert len(record["decode_seconds"]) == 4, record
+    stats = timer.stats()
+    # 4 decode steps at 0.25s each; the 2.0s prefill must not enter this number
+    assert stats["decode_tokens_per_second"] == 4.0, stats
+    assert stats["decode_ms_per_token_median"] == 250.0, stats
+    assert stats["prefill_tokens_per_second"] == 20.0, stats
+    item = timer.item_stats(record)
+    assert item["decode_tps"] == 4.0 and item["prefill_tokens"] == 40, item
+
+
+def t_forward_timer_excludes_cold_item_and_first_decode_steps():
+    clock = _Clock()
+    decode_cost = [1.0]
+    model = _timed_model(clock, lambda: 0.5, lambda: decode_cost[0])
+    saved, E.time = E.time, clock
+    try:
+        timer = E.ForwardTimer(warmup_items=1, warmup_steps=2, sync=False)
+        for index in range(2):
+            with timer.measure(model, "full", index):
+                model.forward(_ids(8), 0)
+                for step in range(5):
+                    model.forward(_ids(1), 8 + step)
+            decode_cost[0] = 0.2          # item 0 was the cold, compiling one
+    finally:
+        E.time = saved
+    stats = timer.stats()
+    assert stats["warmed"] is True, stats
+    assert stats["items_measured"] == 1 and stats["items_total"] == 2, stats
+    # item 1 only, minus its first two decode steps: 3 steps at 0.2s
+    assert stats["decode_steps_measured"] == 3, stats
+    assert stats["decode_tokens_per_second"] == 5.0, stats
+    assert stats["cold_first_decode_seconds"] == 1.0, stats
+
+
+def t_forward_timer_flags_a_run_too_small_to_warm_up():
+    clock = _Clock()
+    model = _timed_model(clock, lambda: 0.5, lambda: 0.4)
+    saved, E.time = E.time, clock
+    try:
+        timer = E.ForwardTimer(warmup_items=1, warmup_steps=2, sync=False)
+        with timer.measure(model, "full", 0):
+            model.forward(_ids(4), 0)
+            model.forward(_ids(1), 4)
+    finally:
+        E.time = saved
+    stats = timer.stats()
+    # LIMIT=1 leaves nothing after the warm-up budget. The measurement is still
+    # reported, but must not claim to be warm.
+    assert stats["warmed"] is False, stats
+    assert stats["decode_tokens_per_second"] == 2.5, stats
+    assert stats["warmup_items_excluded"] == 0, stats
+    assert stats["warmup_decode_steps_excluded_per_item"] == 0, stats
+
+
+def t_forward_timer_restores_forward_and_rejects_a_second_prefill():
+    model = _timed_model(_Clock(), lambda: 0.0, lambda: 0.0)
+    timer = E.ForwardTimer(sync=False)
+
+    def boom():
+        with timer.measure(model, "full", 0):
+            raise RuntimeError("stage failed")
+    must_raise(RuntimeError, boom, "stage failed")
+    assert "forward" not in vars(model), "forward leaked after an exception"
+
+    sentinel = lambda tokens, start_pos=0: ("out",)   # noqa: E731
+    model.forward = sentinel
+    with timer.measure(model, "full", 1):
+        pass
+    assert model.forward is sentinel, "a pre-existing forward must be restored"
+    del model.forward
+
+    def two_prefills():
+        with timer.measure(model, "full", 2):
+            model.forward(_ids(4), 0)
+            model.forward(_ids(4), 0)
+    must_raise(RuntimeError, two_prefills, "two prefill")
+    assert "forward" not in vars(model)
+
+
+def t_forward_timer_validates_its_warmup_budget():
+    must_raise(ValueError, lambda: E.ForwardTimer(warmup_items=-1), "warmup_items")
+    must_raise(ValueError, lambda: E.ForwardTimer(warmup_steps=-1), "warmup_steps")
+    must_raise(ValueError, lambda: E.ForwardTimer(warmup_items=True), "warmup_items")
+
+
 def main():
     print("easyep_v4 logic tests\n")
     for name, fn in sorted(globals().items()):

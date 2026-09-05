@@ -212,9 +212,12 @@ counts, token limits, pruning budget, code, or data; create a new `RUN_ID`.
 
 ## Interpreting results
 
-Raw wall time is misleading when variants emit different token counts. Compare
-tokens per second for throughput, and compare quality only on sufficiently large
-identical datasets. The blinded files under `judge/` should be graded before
+Raw wall time is misleading when variants emit different token counts, and so
+is `completion_tokens / seconds`: that spans prefill and decode together. Report
+`throughput.decode_tokens_per_second` from `summary.json`, and check
+`throughput.warmed` is true before quoting it. For older runs use
+`python v4/analyze_throughput.py --run <dir>`. Compare quality only on
+sufficiently large identical datasets. The blinded files under `judge/` should be graded before
 opening their keys. Report uncertainty or repeated-seed variance where relevant.
 
 The September smoke run at

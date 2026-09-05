@@ -468,6 +468,50 @@ running both measures whether the token-contribution term helps. The standalone
 `pipeline` and `pairs` modes accept `--no-controls` to omit the gating-score,
 frequency, and random controls.
 
+## Throughput
+
+`generate()` issues one prefill forward (`start_pos == 0`, T = prompt length) and
+then one forward per decoded token (T == 1). `completion_tokens / seconds` over
+the whole call is therefore neither rate, and the first call additionally pays
+TileLang kernel compilation. `ForwardTimer` times each forward and reports them
+apart, so the headline number is the **warmed decode rate**:
+
+| field | meaning |
+|---|---|
+| `decode_tokens_per_second` | warmed decode rate - the number to report |
+| `decode_ms_per_token_median` | per-step latency, robust to a stalled step |
+| `prefill_tokens_per_second` | prefill rate, measured separately |
+| `cold_first_prefill_seconds` / `cold_first_decode_seconds` | the excluded compilation cost, kept visible |
+| `warmed` | **false** means the run was too small to drop the warm-up, so the numbers still carry compilation cost |
+
+`WARMUP_ITEMS = 1` whole generate() call and `WARMUP_DECODE_STEPS = 2` steps per
+item are excluded. The exclusions are identical across variants, so their rates
+are comparable; a run smaller than the budget relaxes them and sets
+`warmed: false` rather than reporting a cold number as warm. Every
+`answers_*.jsonl` / `pairs_*.jsonl` row carries its own `decode` block, and each
+variant's `summary.json` entry carries the aggregate under `throughput`.
+
+For runs recorded before this instrumentation, `analyze_throughput.py` estimates
+the split by least squares over the rows:
+
+```bash
+python v4/analyze_throughput.py --run "$EASYEP_RESULTS_ROOT/run_ID"
+```
+
+It reports the measured block directly when present and only falls back to the
+fit otherwise. The fit is unreliable when prompt and completion lengths are
+correlated, and it says so.
+
+Measured on the September rehearsal: decode is **~3.8 tok/s** and prefill
+~244 tok/s, so prefill was ~2s of a ~35s call and the low rate is entirely in
+the decode loop. The reference `inference/generate.py` decodes one token per
+forward at batch 1, and upstream `MoE.forward` forces a device sync per layer
+(`bincount(...).tolist()`) plus an all-reduce per layer, so a decoded token
+costs ~43 syncs and ~86 collectives. Masking does not change this: a pruned
+variant still activates the same top-`k` experts, which is why the pruned
+variants run only ~5-8% faster than `full`. Raising this materially means
+evaluating under an optimised runtime, the way the R1 pipeline uses sglang.
+
 ## Tests
 
 ```bash
@@ -479,7 +523,8 @@ construction and partitioning, hash-layer protection, the gating-score,
 frequency, and random baselines, schema rejection, deterministic score-reduction
 state restoration, cutoff-margin reporting, balanced seeded calibration sampling,
 token-exact chunking,
-prompt-plus-response profiling, the discrimination metric (including that a
+prompt-plus-response profiling, prefill/decode timing separation and its
+warm-up exclusion, the discrimination metric (including that a
 constant "VULNERABLE" answerer scores J=0), label-neutral paired inputs,
 calibration/matched-pair disjointness, neutral prompt/path construction,
 path-traversal rejection, immutable resume comparison, content-bound stage

@@ -43,6 +43,7 @@ import json
 import math
 import os
 import platform
+import statistics
 import sys
 import time
 from argparse import ArgumentParser
@@ -228,6 +229,147 @@ class Profiler:
             state["model_identity"] = model_identity
             state["model_identity_sha256"] = digest
         return state
+
+
+# ----------------------------------------------------------------- throughput
+
+# Reported throughput has to be a decode rate. generate() issues one prefill
+# forward (start_pos == 0, T = prompt length) and then one forward per decoded
+# token (T == 1), so completion_tokens over the elapsed time of the whole call
+# is neither: it averages a prefill that grows with prompt length into the
+# steady-state decode, and the first call additionally pays TileLang kernel
+# compilation. Both are separated here so "tokens per second" means the warmed
+# decode rate and nothing else.
+WARMUP_ITEMS = 1          # whole generate() calls dropped: kernel compilation
+WARMUP_DECODE_STEPS = 2   # decode steps dropped per item: allocator/cache warm-up
+
+
+class ForwardTimer:
+    """Times every model.forward call and separates prefill from warmed decode."""
+
+    def __init__(self, warmup_items: int = WARMUP_ITEMS,
+                 warmup_steps: int = WARMUP_DECODE_STEPS, sync: bool = True):
+        for name, value in (("warmup_items", warmup_items),
+                            ("warmup_steps", warmup_steps)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        self.warmup_items = warmup_items
+        self.warmup_steps = warmup_steps
+        # A sync on a CPU-only build raises; record what actually took effect so
+        # a timing without device synchronisation is never read as one with it.
+        self.sync = bool(sync) and torch.cuda.is_available()
+        self.records: list[dict] = []
+
+    @contextmanager
+    def measure(self, model, tag: str, index: int):
+        """Time one generate() call. model.forward is always restored on exit."""
+        original = model.forward
+        had_own_forward = "forward" in vars(model)
+        record = {"tag": tag, "index": index, "prefill_tokens": 0,
+                  "prefill_seconds": 0.0, "decode_seconds": []}
+
+        def timed(tokens, start_pos=0, *args, **kwargs):
+            # Kernels launch asynchronously, so an unsynchronised timer measures
+            # launch time. The reference MoE already forces a device sync per
+            # layer through bincount().tolist(), so one sync per forward is a
+            # small addition to an already serialised path.
+            if self.sync:
+                torch.cuda.synchronize()
+            started = time.perf_counter()
+            out = original(tokens, start_pos, *args, **kwargs)
+            if self.sync:
+                torch.cuda.synchronize()
+            seconds = time.perf_counter() - started
+            if start_pos == 0:
+                if record["prefill_tokens"]:
+                    raise RuntimeError(
+                        "two prefill forwards inside one generate() call; the "
+                        "prefill/decode split would be silently wrong")
+                record["prefill_tokens"] = int(tokens.size(-1))
+                record["prefill_seconds"] = seconds
+            else:
+                record["decode_seconds"].append(seconds)
+            return out
+
+        model.forward = timed
+        try:
+            yield record
+        finally:
+            if had_own_forward:
+                model.forward = original
+            else:
+                del model.forward
+            self.records.append(record)
+
+    def item_stats(self, record: dict) -> dict:
+        """Warmed decode rate for a single generate() call."""
+        kept = record["decode_seconds"][self.warmup_steps:]
+        seconds = sum(kept)
+        return {
+            "prefill_tokens": record["prefill_tokens"],
+            "prefill_seconds": round(record["prefill_seconds"], 4),
+            "decode_steps": len(record["decode_seconds"]),
+            "decode_steps_measured": len(kept),
+            "decode_seconds_measured": round(seconds, 4),
+            "decode_tps": round(len(kept) / seconds, 3) if seconds > 0 else None,
+        }
+
+    def stats(self) -> dict:
+        """Aggregate warmed decode throughput, with prefill reported separately.
+
+        A small development run (LIMIT=1) can hold fewer items or steps than the
+        warm-up budget. Rather than report an empty measurement or silently fold
+        compilation cost into a "warm" number, the exclusions are relaxed and
+        ``warmed`` says so.
+        """
+        warm_records = self.records[self.warmup_items:]
+        items_excluded, items_warm = self.warmup_items, True
+        if not warm_records:
+            warm_records, items_excluded, items_warm = self.records, 0, False
+
+        def collect(step_warmup: int) -> list:
+            samples = []
+            for record in warm_records:
+                samples.extend(record["decode_seconds"][step_warmup:])
+            return samples
+
+        steps_warmup, steps_warm = self.warmup_steps, True
+        per_step = collect(steps_warmup)
+        if not per_step:
+            steps_warmup, steps_warm = 0, False
+            per_step = collect(0)
+
+        seconds = sum(per_step)
+        prefill_tokens = sum(r["prefill_tokens"] for r in warm_records)
+        prefill_seconds = sum(r["prefill_seconds"] for r in warm_records)
+        stats = {
+            "decode_tokens_per_second": (
+                round(len(per_step) / seconds, 3) if seconds > 0 else None),
+            "decode_ms_per_token_median": (
+                round(1000 * statistics.median(per_step), 3) if per_step else None),
+            "decode_steps_measured": len(per_step),
+            "decode_seconds_measured": round(seconds, 4),
+            "prefill_tokens": prefill_tokens,
+            "prefill_seconds": round(prefill_seconds, 4),
+            "prefill_tokens_per_second": (
+                round(prefill_tokens / prefill_seconds, 1)
+                if prefill_seconds > 0 else None),
+            "items_total": len(self.records),
+            "items_measured": len(warm_records),
+            "warmup_items_excluded": items_excluded,
+            "warmup_decode_steps_excluded_per_item": steps_warmup,
+            # False means the run was too small to drop the warm-up, so these
+            # numbers still carry compilation and first-token cost.
+            "warmed": bool(items_warm and steps_warm),
+            "synchronized": self.sync,
+        }
+        if self.records:
+            first = self.records[0]
+            stats["cold_first_prefill_seconds"] = round(first["prefill_seconds"], 4)
+            stats["cold_first_decode_seconds"] = (
+                round(first["decode_seconds"][0], 4)
+                if first["decode_seconds"] else None)
+        return stats
 
 
 # ------------------------------------------------------------------ patching
@@ -2354,13 +2496,16 @@ def cmd_pairs(a) -> None:
         set_mask(model, m, args.n_hash_layers, dev)
         say(f"variant={tag}: {len(items)} items")
         rows = []
+        # Same exclusion rule as the question eval, so the two suites' decode
+        # rates are directly comparable.
+        timer = ForwardTimer()
         for i, item in enumerate(prepared_items):
             pid, ids = item["pair_id"], item["prompt_ids"]
             # Both members of a matched pair receive identical decoder noise.
             torch.manual_seed(a.seed + pid)
             torch.cuda.manual_seed_all(a.seed + pid)
             t1 = time.time()
-            with torch.inference_mode():
+            with torch.inference_mode(), timer.measure(model, tag, pid) as timing:
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion, n_completion = _decode_completion(tok, gen, ids)
             answer, answer_extracted = final_message(
@@ -2381,7 +2526,9 @@ def cmd_pairs(a) -> None:
                              "temperature": args.temperature,
                              "prompt_tokens": len(ids),
                              "completion_tokens": n_completion,
-                             "seconds": round(time.time() - t1, 2)})
+                             # prefill+decode together; "decode" isolates the rate
+                             "seconds": round(time.time() - t1, 2),
+                             "decode": timer.item_stats(timing)})
                 if (i + 1) % 10 == 0:
                     say(f"  {tag} {i+1}/{len(items)}")
         if rank == 0:
@@ -2389,6 +2536,7 @@ def cmd_pairs(a) -> None:
                 for r in rows:
                     fp.write(json.dumps(r) + "\n")
             summary[tag] = discrimination_stats(rows)
+            summary[tag]["throughput"] = timer.stats()
 
     if rank == 0:
         decoding_note = (
@@ -3069,6 +3217,9 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
         set_mask(model, m, args.n_hash_layers, dev)
         say(f"phase 3: evaluating variant={tag} on {len(questions)} questions")
         rows = []
+        # One timer per variant: the exclusion rule must be identical across
+        # variants or their throughput numbers are not comparable.
+        timer = ForwardTimer()
         for i, q, prompt, ids in prepared:
             # Greedy decoding is the primary comparison. Reseeding per question
             # keeps positive-temperature robustness runs reproducible, but matching
@@ -3077,7 +3228,7 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
             torch.manual_seed(a.seed + i)
             torch.cuda.manual_seed_all(a.seed + i)
             t1 = time.time()
-            with torch.inference_mode():
+            with torch.inference_mode(), timer.measure(model, tag, i) as timing:
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion, n_completion = _decode_completion(tok, gen, ids)
             answer, answer_extracted = final_message(
@@ -3103,7 +3254,10 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                     "temperature": args.temperature,
                     "prompt_tokens": len(ids),
                     "completion_tokens": n_completion,
+                    # spans prefill and decode together; "decode" is the
+                    # isolated rate and the one to report
                     "seconds": round(time.time() - t1, 2),
+                    "decode": timer.item_stats(timing),
                 })
                 say(f"  {tag} {i+1}/{len(questions)}  {time.time()-t1:.1f}s")
         if rank == 0:
@@ -3123,6 +3277,7 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                     sum(r["completion_tokens"] for r in rows) / max(len(rows), 1), 1),
                 "max_completion_tokens": max(
                     (r["completion_tokens"] for r in rows), default=0),
+                "throughput": timer.stats(),
             }
 
     if rank == 0:
@@ -3144,9 +3299,13 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
             f"on layers {args.n_hash_layers}..{args.n_layers-1}")
         for tag in [t for t, _ in variants]:
             st_ = summary.get(tag, {})
+            tp_ = st_.get("throughput", {})
+            cold_ = "" if tp_.get("warmed") else "  [COLD: run too small to warm up]"
             say(f"  {tag:17s} n={st_.get('n')}  mean {st_.get('mean_seconds')}s  "
                 f"{st_.get('mean_completion_tokens')} tok "
                 f"(max {st_.get('max_completion_tokens')}) -> answers_{tag}.jsonl")
+            say(f"  {'':17s} decode {tp_.get('decode_tokens_per_second')} tok/s, "
+                f"prefill {tp_.get('prefill_tokens_per_second')} tok/s{cold_}")
         say("  no scoring applied; grade with `blind` + your own judge")
         say("=" * 60)
     if world_size > 1:
