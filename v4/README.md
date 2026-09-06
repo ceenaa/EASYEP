@@ -517,7 +517,15 @@ outlier, and `pairs` rejects over-context items rather than truncating and
 reports how many it dropped.
 
 The converted corpus is experiment data: gitignored like
-`deepseek_easy_ep_inputs/`, with only its digest in the run manifest.
+`deepseek_easy_ep_inputs/`.
+
+**It is not yet covered by the run manifest.** `run_provenance.py` hashes
+`vulnerable-js-files/` by name (`inputs.calibration_and_pair_tree`,
+`inputs.pair_manifest`), so a PrimeVul corpus contributes nothing to the run
+provenance and a PrimeVul run is not tamper-evident the way a CodeQL one is.
+`primevul_dataset.py verify` re-checks every member against the manifest and the
+score artifact carries the manifest digest, but neither is the run manifest.
+Closing this properly means parameterising the launcher, which has not been done.
 
 ### Which split to use for what
 
@@ -669,7 +677,7 @@ evaluating under an optimised runtime, the way the R1 pipeline uses sglang.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 84 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 85 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask

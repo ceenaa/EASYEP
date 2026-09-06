@@ -2541,15 +2541,15 @@ def t_split_aware_selection_keeps_the_evaluation_set_whole():
         assert not (set(paths) & {p for pair in pairs
                                   for p in (pair["vuln_path"], pair["safe_path"])})
 
-        # An empty selection is refused, not reported as "found only 0".
+        # A split this corpus does not hold is refused by name, on both sides,
+        # rather than silently selecting nothing.
+        absent = E.normalise_splits("valid_paired")
         must_raise(ValueError,
-                   lambda: E.sample_calibration_files(
-                       root, 2, splits=E.normalise_splits("valid_paired")),
-                   "no calibration candidates")
+                   lambda: E.sample_calibration_files(root, 2, splits=absent),
+                   "no split(s) valid_paired")
         must_raise(ValueError,
-                   lambda: E.load_pairs(root / P.MANIFEST_NAME, root, 1,
-                                        splits=E.normalise_splits("valid_paired")),
-                   "no rows in split")
+                   lambda: E.load_pairs(root / P.MANIFEST_NAME, root, 1, splits=absent),
+                   "no split(s) valid_paired")
 
         # The splits actually profiled are recorded, so a result can say so.
         record = E._calibration_provenance(
@@ -2700,6 +2700,33 @@ def t_primevul_cwe_alias_is_not_shadowed_by_an_empty_field():
     assert P.normalise_cwe({"cwe": ["CWE-20"], "cwe_ids": ["CWE-787"]}) == ["CWE-20"]
     assert P.normalise_cwe({"cwe_ids": "CWE-416"}) == ["CWE-416"]
     assert P.normalise_cwe({}) == []
+
+
+def t_split_requests_reject_every_unknown_name_not_just_all_of_them():
+    """A typo in a comma-separated list must not quietly select the rest.
+
+    Matching is per row, so `train_paired,test_paried` would evaluate training
+    data while the command line claims test, and no output would disagree.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = converted_primevul_corpus(
+            Path(td), count=6, splits=("train_paired", "test_paired"))
+        manifest = root / P.MANIFEST_NAME
+        typo = E.normalise_splits("train_paired,test_paried")
+        must_raise(ValueError,
+                   lambda: E.load_pairs(manifest, root, 2, seed=1, splits=typo),
+                   "no split(s) test_paried")
+        must_raise(ValueError,
+                   lambda: E.sample_calibration_files(root, 2, seed=1, splits=typo),
+                   "no split(s) test_paried")
+        # The error names what is actually available, so the typo is obvious.
+        error = must_raise(ValueError,
+                           lambda: E.load_pairs(manifest, root, 2, splits=typo))
+        assert "test_paired, train_paired" in str(error), str(error)
+        # A wholly valid list is unaffected.
+        both = E.normalise_splits("train_paired,test_paired")
+        assert len(E.load_pairs(manifest, root, 4, seed=1, splits=both)) == 4
+        assert E.require_known_splits({"a", "b"}, None, "src") is None
 
 
 def main():

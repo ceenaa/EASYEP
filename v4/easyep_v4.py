@@ -1536,6 +1536,25 @@ def row_in_splits(row: dict, splits: tuple[str, ...] | None, source: str) -> boo
     return value in splits
 
 
+def require_known_splits(available: set[str], splits: tuple[str, ...] | None,
+                        source: str) -> None:
+    """Every requested split must exist, not merely one of them.
+
+    Matching is per row, so a comma-separated list containing a typo selects the
+    splits that did match and silently drops the rest: `train_paired,test_paried`
+    evaluates training data while the command line says it evaluates test, and
+    nothing in the output disagrees. Only a request that matched *nothing* would
+    otherwise be caught.
+    """
+    if not splits:
+        return
+    unknown = sorted(set(splits) - available)
+    if unknown:
+        raise ValueError(
+            f"{source} has no split(s) {', '.join(unknown)}; it contains "
+            f"{', '.join(sorted(available)) if available else '(no split labels)'}")
+
+
 def normalise_splits(splits) -> tuple[str, ...] | None:
     if not splits:
         return None
@@ -1636,11 +1655,16 @@ def _manifest_calibration_candidates(
     manifest = find_pair_manifest(root)
     if manifest is None:
         return []
+    parsed = [(index, json.loads(line)) for index, line
+              in enumerate(manifest.read_text(encoding="utf-8").splitlines())
+              if line.strip()]
+    if splits:
+        require_known_splits(
+            {row.get("primevul_split") for _, row in parsed
+             if isinstance(row.get("primevul_split"), str)},
+            splits, str(manifest))
     candidates = []
-    for pair_index, line in enumerate(manifest.read_text(encoding="utf-8").splitlines()):
-        if not line.strip():
-            continue
-        row = json.loads(line)
+    for pair_index, row in parsed:
         if not pair_row_is_labelled(row):
             continue
         if not row_in_splits(row, splits, str(manifest)):
@@ -2444,6 +2468,10 @@ def load_pairs(manifest: Path, root: Path, n: int, seed: int = 42,
         # Filter before the shuffle so the requested split is the whole
         # population, not a random slice of every split that sorted early.
         # Refuse an empty result rather than reporting "found only 0".
+        require_known_splits(
+            {row.get("primevul_split") for row in rows
+             if isinstance(row.get("primevul_split"), str)},
+            splits, str(manifest))
         kept = [row for row in rows if row_in_splits(row, splits, str(manifest))]
         selection["skipped_other_split"] = len(rows) - len(kept)
         if not kept:
@@ -2756,6 +2784,12 @@ def cmd_pairs(a) -> None:
     if rank == 0:
         provenance = {
             "seed": a.seed, "requested": a.n_pairs, "input_token_limit": input_limit,
+            # Which corpus and which splits these pairs came from. The run log
+            # says it, but a saved result has to be able to prove it on its own:
+            # without this, pairs_used.json cannot distinguish an evaluation on
+            # test_paired from one that silently drew from every split.
+            "corpus": pair_corpus,
+            "corpus_splits": list(pair_splits) if pair_splits else None,
             "decoding": {"temperature": args.temperature,
                          "max_new_tokens": a.max_new_tokens,
                          "max_seq_len": a.max_seq_len,
@@ -2767,9 +2801,13 @@ def cmd_pairs(a) -> None:
                 "calibration": st["calibration"],
             },
             "selection": selection,
+            # ground_truth and split travel with each pair: alert_locations is
+            # meaningless for a commit-derived pair, and without ground_truth a
+            # reader cannot tell what this row's VULNERABLE label rests on.
             "pairs": [{**{key: pair.get(key) for key in
                            ("pair_id", "vuln_path", "safe_path", "original_sha256",
-                            "secure_sha256", "queries", "alert_locations")},
+                            "secure_sha256", "queries", "alert_locations",
+                            "ground_truth", "split")},
                        "prompts": prompt_provenance[pair["pair_id"]]}
                       for pair in pairs],
         }
@@ -2841,6 +2879,16 @@ def cmd_pairs(a) -> None:
             "score_schema_version": st["score_schema_version"],
             "score_semantics": st["score_semantics"],
             "model_identity_sha256": st["model_identity_sha256"],
+        }
+        # The metrics above mean different things on different corpora -- a
+        # PrimeVul SAFE member is only known to lack the flaw its commit fixed --
+        # so the summary names the corpus, the splits it drew from, and the
+        # splits the masks were calibrated on rather than leaving that in a log.
+        summary["_corpus"] = {
+            "corpus": pair_corpus,
+            "evaluated_splits": list(pair_splits) if pair_splits else None,
+            "calibrated_splits": calibration.get("corpus_splits"),
+            "ground_truth": sorted({pair.get("ground_truth") for pair in pairs}),
         }
         (out / "pairs_summary.json").write_text(json.dumps(summary, indent=1))
         say("=" * 72)

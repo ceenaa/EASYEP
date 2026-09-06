@@ -29,7 +29,7 @@ Read `v4/README.md` before changing anything in `v4/`; it is the design record, 
 
 ### Tests (V4)
 
-No GPU, no model, seconds. 84 `t_*` functions run by a hand-rolled runner in
+No GPU, no model, seconds. 85 `t_*` functions run by a hand-rolled runner in
 `v4/test_easyep_v4.py` — **not pytest**, despite the stale `.pytest_cache/`.
 
 ```bash
