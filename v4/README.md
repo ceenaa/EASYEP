@@ -658,8 +658,9 @@ env -u RUN_ID -u RESUME sbatch --account=YOUR_ALLOCATION \
   --export=ALL,RUN_ID=sweep_001,RESUME=0 v4/easyep.sbatch
 ```
 
-The launcher rejects a `KEEP_SWEEP` that is not comma-separated integers, so a
-value mangled this way fails loudly rather than silently sweeping one level.
+The launcher validates the value it receives, but it cannot detect this specific
+truncation because `115` alone is still valid. Keep comma-bearing values out of
+`--export`; the inherited-variable form above preserves the complete sweep.
 
 Only the primary score is swept. The controls stay at the `KEEP` baseline because
 they answer a different question -- *does the scoring carry signal at all* -- and
