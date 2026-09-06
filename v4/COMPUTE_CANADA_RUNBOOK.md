@@ -45,6 +45,58 @@ test -f "$EASYEP_DATA_ROOT/questions_used.json"
 The launcher rejects tracked or staged source changes for a new run. Commit the
 intended implementation first; do not bypass this protection.
 
+## Adding the PrimeVul corpus (optional, one-time)
+
+The launcher runs the JavaScript CodeQL corpus. PrimeVul (C/C++) is a second
+corpus for the standalone modes; see "Corpora" in `v4/README.md` for what its
+labels mean and why the two are not interchangeable.
+
+PrimeVul is on Google Drive, so download it by hand from
+<https://github.com/DLVulDet/PrimeVul>. Take the three **paired** files -
+`primevul_train_paired.jsonl` (~50 MB), `primevul_valid_paired.jsonl` (~5.4 MB)
+and `primevul_test_paired.jsonl` (~5.8 MB). Skip the unpaired
+`primevul_{train,valid,test}.jsonl` (~573 MB, no benign counterpart, refused by
+the converter) and skip `file_info.json` / `file_contents/` (whole-file context
+the pipeline does not use). Nothing here is committed to the repository.
+
+```bash
+# on a login node; needs no GPU, no venv, and only the standard library
+PV=/scratch/sinam/primevul            # wherever the .jsonl landed
+C="$EASYEP_DATA_ROOT/primevul-c-files"
+python v4/primevul_dataset.py describe --primevul-dir "$PV"
+python v4/primevul_dataset.py convert  --primevul-dir "$PV" --out "$C" \
+    --split train_paired --split valid_paired --split test_paired
+python v4/primevul_dataset.py verify   --root "$C"
+```
+
+That is 4694 pairs (3785 train / 476 valid / 433 test) in one root, which takes
+about two seconds. Keep all three in **one** root: the corpus identity is the
+manifest digest, so two roots would make calibration and evaluation refuse each
+other. Choose per stage instead:
+
+```bash
+# calibrate on train, evaluate on test; valid stays free for tuning KEEP
+"$EASYEP_VENV/bin/torchrun" --nproc-per-node=4 v4/easyep_v4.py pipeline \
+    --calib-dir "$C" --calib-splits train_paired --profile-only ...
+"$EASYEP_VENV/bin/torchrun" --nproc-per-node=4 v4/easyep_v4.py pairs \
+    --calib-dir "$C" --pairs-splits test_paired \
+    --pairs-manifest "$C/PRIMEVUL_PAIRED_MANIFEST.jsonl" ...
+```
+
+Omitting the flags draws from every split, which on this root means an
+evaluation about 90% training data - so name them. Calibrating from a split you
+do not evaluate on also keeps the whole 433-pair test set available;
+`skipped_calibration_overlap` should read 0.
+
+Do not rename the output directory afterwards: the manifest addresses members
+relative to the corpus root's parent, so a rename detaches the corpus from its
+own labels. `verify` reports that case by name.
+
+Because the corpus differs, its score artifact is not interchangeable with a
+CodeQL one. `pairs` refuses a score artifact calibrated on a different corpus
+with `was calibrated on ... but this evaluation draws from ...`; profile against
+the corpus you intend to evaluate rather than reusing an existing artifact.
+
 ## Experimental defaults
 
 The main launcher defaults are:

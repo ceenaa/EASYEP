@@ -38,6 +38,10 @@ run_provenance_spec = importlib.util.spec_from_file_location(
     "run_provenance", HERE / "run_provenance.py")
 R = importlib.util.module_from_spec(run_provenance_spec)
 run_provenance_spec.loader.exec_module(R)
+primevul_spec = importlib.util.spec_from_file_location(
+    "primevul_dataset", HERE / "primevul_dataset.py")
+P = importlib.util.module_from_spec(primevul_spec)
+primevul_spec.loader.exec_module(P)
 
 PASS, FAIL = [], []
 
@@ -1931,14 +1935,42 @@ def t_calibration_provenance_binds_inputs_responses_and_parameters():
                                        "file_index": 0, "chunk_index": 0,
                                        "tokens": 2,
                                        "token_ids_sha256": E._ids_sha256([7, 8])}]}
+    corpus = {"corpus_schema_version": 1, "name": "vulnerable-js-files",
+              "manifest": "CODEQL_SECURE_MANIFEST.jsonl",
+              "ground_truth": E.GROUND_TRUTH_CODEQL, "rows": 1,
+              "manifest_sha256": "c" * 64}
     record = E._calibration_provenance(
         files, inputs, result, seed=965, temperature=0.6,
         max_seq_len=64, max_new_tokens=8, max_chunks=0,
-        source_kind="corpus_files", security_prompt=True)
+        source_kind="corpus_files", security_prompt=True, corpus=corpus)
     E._validate_calibration_provenance(record)
+    assert record["corpus"] == corpus
     assert record["selected_sources"][0]["text_sha256"] == \
         hashlib.sha256(files[0][1].encode()).hexdigest()
     assert record["prompt_chunks"][0]["prompt_ids_sha256"] == E._ids_sha256([4, 5, 6])
+
+    # A corpus root with no matched-pair manifest has no identity, and
+    # sample_calibration_files supports exactly that tree, so writing the record
+    # must succeed. Refusing here would abort a legitimate profile-then-evaluate-
+    # questions run after the whole calibration, from a rank-0-only branch.
+    manifestless = E._calibration_provenance(
+        files, inputs, result, seed=965, temperature=0.6,
+        max_seq_len=64, max_new_tokens=8, max_chunks=0,
+        source_kind="corpus_files", security_prompt=True)
+    E._validate_calibration_provenance(manifestless)
+    assert manifestless["corpus"] is None
+    # The question evaluation accepts it; only matched-pair evaluation, which
+    # actually draws from a corpus, refuses it.
+    assert E._require_evaluation_calibration(
+        {"calibration": manifestless}, "fixture", need_corpus_paths=True) is manifestless
+    must_raise(SystemExit, lambda: E._require_evaluation_calibration(
+        {"calibration": manifestless}, "fixture", require_corpus=corpus),
+        "records no corpus identity")
+    # Raw-text calibration draws from no corpus, so None is the honest record.
+    assert E._calibration_provenance(
+        files, inputs, result, seed=965, temperature=0.6,
+        max_seq_len=64, max_new_tokens=8, max_chunks=0,
+        source_kind="sample_texts", security_prompt=False)["corpus"] is None
 
     tampered = json.loads(json.dumps(record))
     tampered["parameters"]["temperature"] = float("nan")
@@ -2149,6 +2181,525 @@ def t_forward_timer_validates_its_warmup_budget():
     must_raise(ValueError, lambda: E.ForwardTimer(warmup_items=-1), "warmup_items")
     must_raise(ValueError, lambda: E.ForwardTimer(warmup_steps=-1), "warmup_steps")
     must_raise(ValueError, lambda: E.ForwardTimer(warmup_items=True), "warmup_items")
+
+
+# ------------------------------------------------------ PrimeVul corpus
+
+
+def primevul_rows(count=8, start=0):
+    """Synthetic PrimeVul records in the shape the paired splits ship in."""
+    rows = []
+    for i in range(start, start + count):
+        cwe = ["CWE-119", "CWE-787", ""][i % 3]
+        cpp = i % 2 == 0
+        vulnerable = ("void f%d(char *s) { std::memcpy(b, s, strlen(s)); }\n" % i
+                      if cpp else "void f%d(char *s) { memcpy(b, s, strlen(s)); }\n" % i)
+        rows.append({"project": ["Chrome", "linux", "ImageMagick6"][i % 3],
+                     "commit_id": f"{i:040x}", "target": 1, "func": vulnerable,
+                     "cwe": cwe, "idx": 1000 + 2 * i})
+        rows.append({"project": ["Chrome", "linux", "ImageMagick6"][i % 3],
+                     "commit_id": f"{i:040x}", "target": 0,
+                     "func": vulnerable.replace("strlen(s)", "sizeof(b)"),
+                     "cwe": cwe, "idx": 1001 + 2 * i})
+    return rows
+
+
+def write_primevul(directory, rows, split="test_paired"):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"primevul_{split}.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def converted_primevul_corpus(base, count=8, splits=("test_paired",)):
+    """A materialised PrimeVul corpus root, ready for the normal loaders."""
+    offset = 0
+    for split in splits:
+        write_primevul(base / "src", primevul_rows(count, start=offset), split=split)
+        offset += count
+    root = base / "primevul-c-files"
+    P.convert(base / "src", root, list(splits))
+    return root
+
+
+def t_primevul_corpus_feeds_the_ordinary_calibration_and_pair_loaders():
+    """The converter's whole purpose: no new loader, no new guarantees to re-earn."""
+    with tempfile.TemporaryDirectory() as td:
+        root = converted_primevul_corpus(Path(td))
+        corpus = E.corpus_identity(root)
+        assert corpus["ground_truth"] == E.GROUND_TRUTH_PRIMEVUL
+        assert corpus["rows"] == 8 and corpus["manifest"] == P.MANIFEST_NAME
+
+        selected = E.sample_calibration_files(root, 6, seed=965)
+        paths = [path for path, _ in selected]
+        assert len(paths) == 6
+        # balanced across the two labels, as for the CodeQL tree
+        assert sum("_Code" in path for path in paths) in (3, 4)
+        # and never both revisions of one function, which would make the
+        # "calibration and evaluation are disjoint" claim untrue by construction
+        assert len({path.rsplit("/", 1)[0] for path in paths}) == len(paths)
+        assert paths == [p for p, _ in E.sample_calibration_files(root, 6, seed=965)]
+        for path, content in selected:
+            assert content == (root / path).read_text(encoding="utf-8")
+
+        stats = {}
+        pairs = E.load_pairs(root / P.MANIFEST_NAME, root, 2, seed=7, stats=stats,
+                             exclude_relative_paths=set(paths))
+        assert all(pair["ground_truth"] == E.GROUND_TRUTH_PRIMEVUL for pair in pairs)
+        for pair in pairs:
+            assert not ({pair["vuln_path"], pair["safe_path"]} & set(paths))
+        # The six calibration files come from six distinct pairs, so only two of
+        # the eight remain usable. Asking for a third must fail rather than
+        # quietly reusing a profiled function as an evaluation item.
+        must_raise(ValueError,
+                   lambda: E.load_pairs(root / P.MANIFEST_NAME, root, 3, seed=7,
+                                        exclude_relative_paths=set(paths)),
+                   "found only 2")
+
+        # Both members of a C/C++ pair reach the model under one neutral path,
+        # so the suffix cannot leak which revision is which.
+        items = E._pair_eval_items(pairs)
+        shown = {path for _, _, path, _ in items}
+        assert shown <= {"review_target.c", "review_target.cpp"}, shown
+        for pair in pairs:
+            displayed = {path for pid, _, path, _ in items if pid == pair["pair_id"]}
+            assert len(displayed) == 1, displayed
+        prompt = E.security_review_text(pairs[0]["safe_path"], "int x;")
+        assert "_Code" not in prompt and "CWE-" not in prompt
+
+
+def t_primevul_rows_cannot_borrow_the_codeql_alert_gate():
+    """Each ground truth is admitted by the check that means something for it."""
+    # CodeQL rows behave exactly as before, including the absent-field default.
+    assert E.pair_row_ground_truth({}) == E.GROUND_TRUTH_CODEQL
+    assert E.pair_row_is_labelled({"alert_locations": 1}) is True
+    assert E.pair_row_is_labelled({"alert_locations": 0}) is False
+    assert E.pair_row_is_labelled({}) is False
+    must_raise(ValueError, lambda: E.pair_row_is_labelled({"alert_locations": "lots"}),
+               "invalid alert_locations")
+    must_raise(ValueError, lambda: E.pair_row_ground_truth({"ground_truth": "vibes"}),
+               "unknown pair manifest ground_truth")
+
+    # Writing an alert count into a PrimeVul row must not buy it past the gate:
+    # that would report a scanner finding that never happened.
+    must_raise(ValueError, lambda: E.pair_row_is_labelled(
+        {"ground_truth": E.GROUND_TRUTH_PRIMEVUL, "alert_locations": 99}),
+        "does not name a fixing commit")
+    must_raise(ValueError, lambda: E.pair_row_is_labelled(
+        {"ground_truth": E.GROUND_TRUTH_PRIMEVUL, "commit_id": "abc",
+         "original_sha256": "a" * 64, "secure_sha256": "a" * 64}), "identical")
+    assert E.pair_row_is_labelled(
+        {"ground_truth": E.GROUND_TRUTH_PRIMEVUL, "commit_id": "abc",
+         "original_sha256": "a" * 64, "secure_sha256": "b" * 64}) is True
+
+
+def t_corpus_identity_is_bound_to_the_manifest_and_refuses_ambiguity():
+    with tempfile.TemporaryDirectory() as td:
+        root = converted_primevul_corpus(Path(td))
+        manifest = root / P.MANIFEST_NAME
+        before = E.corpus_identity(root)["manifest_sha256"]
+
+        # A corpus that loses a pair is a different corpus.
+        lines = manifest.read_text(encoding="utf-8").splitlines(True)
+        manifest.write_text("".join(lines[:-1]), encoding="utf-8")
+        assert E.corpus_identity(root)["manifest_sha256"] != before
+        manifest.write_text("".join(lines), encoding="utf-8")
+
+        # Calibration sampling finds the manifest by name rather than being
+        # handed one, so a second manifest would make the corpus's identity
+        # depend on which name was checked first.
+        (root / "CODEQL_SECURE_MANIFEST.jsonl").write_text(
+            json.dumps({"alert_locations": 1}) + "\n", encoding="utf-8")
+        must_raise(ValueError, lambda: E.corpus_identity(root), "exactly one")
+        must_raise(ValueError, lambda: E.sample_calibration_files(root, 2), "exactly one")
+        (root / "CODEQL_SECURE_MANIFEST.jsonl").unlink()
+
+        # One corpus makes one kind of claim about its labels.
+        rows = [json.loads(line) for line in lines]
+        rows[0]["ground_truth"] = E.GROUND_TRUTH_CODEQL
+        rows[0]["alert_locations"] = 1
+        manifest.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        must_raise(ValueError, lambda: E.corpus_identity(root), "mixes ground truths")
+
+    with tempfile.TemporaryDirectory() as td:
+        # No manifest, no identity -- which is what the raw-text path records.
+        assert E.corpus_identity(Path(td)) is None
+
+
+def t_score_artifact_cannot_be_evaluated_against_a_different_corpus():
+    """Masks calibrated on one corpus say nothing about routing on the other."""
+    codeql = {"corpus_schema_version": 1, "name": "vulnerable-js-files",
+              "manifest": "CODEQL_SECURE_MANIFEST.jsonl",
+              "ground_truth": E.GROUND_TRUTH_CODEQL, "rows": 4,
+              "manifest_sha256": "a" * 64}
+    primevul = dict(codeql, name="primevul-c-files", manifest=P.MANIFEST_NAME,
+                    ground_truth=E.GROUND_TRUTH_PRIMEVUL, manifest_sha256="b" * 64)
+
+    record = fixture_calibration_provenance()
+    record["provenance_schema_version"] = 2
+    record["corpus"] = codeql
+    E._validate_calibration_provenance(record)
+    state = {"calibration": record}
+    assert E._require_evaluation_calibration(
+        state, "fixture", need_corpus_paths=True, require_corpus=codeql) is record
+    must_raise(SystemExit, lambda: E._require_evaluation_calibration(
+        state, "fixture", need_corpus_paths=True, require_corpus=primevul),
+        "was calibrated on")
+
+    # A version-1 artifact predates corpus identity: it cannot prove which
+    # corpus it came from, so it is refused rather than assumed compatible.
+    legacy = fixture_calibration_provenance()
+    E._validate_calibration_provenance(legacy)
+    assert E._require_evaluation_calibration(
+        {"calibration": legacy}, "fixture", need_corpus_paths=True) is legacy
+    must_raise(SystemExit, lambda: E._require_evaluation_calibration(
+        {"calibration": legacy}, "fixture", require_corpus=codeql),
+        "records no corpus identity")
+
+    malformed = json.loads(json.dumps(record))
+    malformed["corpus"] = dict(codeql, manifest_sha256="short")
+    must_raise(SystemExit, lambda: E._validate_calibration_provenance(malformed),
+               "malformed corpus identity")
+    dropped = json.loads(json.dumps(record)); del dropped["corpus"]
+    must_raise(SystemExit, lambda: E._validate_calibration_provenance(dropped),
+               "which corpus")
+
+
+
+
+def t_primevul_pairing_is_verified_rather_than_assumed():
+    """One misaligned row would shift every later label by one, silently."""
+    def rows(*specs):
+        return [{"project": "p", "commit_id": commit, "target": target, "func": func,
+                 "cwe": ["CWE-119"], "cve": "", "file_name": "f.c", "idx": i,
+                 "line": i + 1}
+                for i, (commit, target, func) in enumerate(specs)]
+
+    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "x")), "f"), "even")
+    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "x"), ("b", 1, "y")), "f"),
+               "unpaired split")
+    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "x"), ("a", 0, "x")), "f"),
+               "identical source")
+    must_raise(ValueError, lambda: P.pair_rows(rows(("", 1, "x"), ("", 0, "y")), "f"),
+               "no commit_id")
+
+    # Members carrying different commit ids or file names are real pairs in the
+    # shipped release (19 and 234 of them across the three paired splits), so
+    # they are counted and surfaced rather than treated as corruption -- which
+    # would silently discard them.
+    stats = {}
+    pairs = P.pair_rows(rows(("a", 1, "x"), ("b", 0, "y")), "f", stats=stats)
+    assert len(pairs) == 1 and stats["commit_id_differs"] == 1
+    assert pairs[0][0]["commit_id"] == "a", "the vulnerable member names the flaw"
+    # The vulnerable member is identified by its label, not by its position.
+    for order in ((1, "bad"), (0, "safe")), ((0, "safe"), (1, "bad")):
+        (vulnerable, benign), = P.pair_rows(
+            rows(("a", order[0][0], order[0][1]), ("a", order[1][0], order[1][1])), "f")
+        assert vulnerable["target"] == 1 and benign["target"] == 0
+
+
+def t_primevul_reader_refuses_ambiguous_or_mixed_schemas():
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "primevul_test_paired.jsonl"
+        for payload, expected in (
+                ([{"target": 1, "func": "x"}, {"label": 0, "func": "y"}],
+                 "mixes primevul schema variants"),
+                ([{"target": 2, "func": "x"}], "labels are 1"),
+                ([{"target": True, "func": "x"}], "labels are 1"),
+                ([{"func": "x"}], "no label field"),
+                ([{"target": 1, "code": "x"}], "no source field"),
+                ([{"target": 1, "func": "   "}], "empty func")):
+            path.write_text("".join(json.dumps(r) + "\n" for r in payload), encoding="utf-8")
+            must_raise(ValueError, lambda p=path: P.read_primevul_rows(p), expected)
+        path.write_text("{not json\n", encoding="utf-8")
+        must_raise(ValueError, lambda: P.read_primevul_rows(path), "not valid json")
+        path.write_text("", encoding="utf-8")
+        must_raise(ValueError, lambda: P.read_primevul_rows(path), "no records")
+
+        # Which field carried the label is recorded, not silently guessed.
+        write_primevul(Path(td), primevul_rows(2))
+        _, report = P.read_primevul_rows(path)
+        assert report["label_field"] == "target" and report["code_field"] == "func"
+
+    assert P.normalise_cwe({"cwe": ["CWE-119", "cwe-119", "cwe-787"]}) == \
+        ["CWE-119", "CWE-787"], "v0.1 ships a list, the original a string"
+    assert P.normalise_cwe({"cwe": ""}) == [] and P.stratum_of([]) == "CWE-UNKNOWN"
+    # PrimeVul's own filename settles the language when it has one; the marker
+    # heuristic is only the fallback for rows that carry none.
+    assert P.guess_extension("memcpy(a, b, c);", "tensor_op.cc") == ".cc"
+    assert P.guess_extension("std::string s;", "property.c") == ".c"
+    assert P.guess_extension("int x;", "harness.py") == ".c", "unknown suffix falls back"
+    assert P.guess_extension("std::string s;") == ".cpp"
+    assert P.guess_extension("memcpy(a, b, c);") == ".c"
+    # v0.1 writes a missing filename as the literal string "None".
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "primevul_test_paired.jsonl"
+        path.write_text(json.dumps(
+            {"target": 1, "func": "x", "file_name": "None"}) + "\n", encoding="utf-8")
+        assert P.read_primevul_rows(path)[0][0]["file_name"] == ""
+
+
+def t_primevul_conversion_dedupes_and_refuses_to_clobber():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        # The same function under the same labels twice -- which happens across
+        # splits -- would let a calibration draw and an evaluation item share
+        # bytes while path-based exclusion sees two unrelated files.
+        duplicated = primevul_rows(1) + primevul_rows(1)
+        write_primevul(base / "src", duplicated)
+        provenance = P.convert(base / "src", base / "primevul-c-files", ["test_paired"])
+        assert provenance["stats"] == {"pairs_read": 2, "skipped_duplicate": 1,
+                                       "skipped_oversized": 0, "written": 1}
+        assert provenance["ground_truth"] == E.GROUND_TRUTH_PRIMEVUL
+        assert provenance["corpus_root_name"] == "primevul-c-files"
+
+        must_raise(SystemExit,
+                   lambda: P.convert(base / "src", base / "primevul-c-files",
+                                     ["test_paired"]), "already exists")
+        must_raise(SystemExit,
+                   lambda: P.convert(base / "src", base / "split", ["train_paired"]),
+                   "missing primevul_train_paired.jsonl")
+        must_raise(SystemExit,
+                   lambda: P.convert(base / "src", base / "capped", ["test_paired"],
+                                     max_pairs=5), "only 1 were usable")
+        must_raise(SystemExit,
+                   lambda: P.convert(base / "src", base / "tiny", ["test_paired"],
+                                     max_func_chars=1), "no usable pairs")
+        # A conversion that aborts must not leave a manifest-less directory the
+        # --overwrite guard would then refuse to replace.
+        for leftover in ("split", "capped", "tiny"):
+            assert not (base / leftover).exists(), f"{leftover} survived a failed convert"
+        # --overwrite must not be a way to delete an unrelated directory.
+        stranger = base / "stranger"
+        stranger.mkdir()
+        (stranger / "keep.txt").write_text("not a corpus\n", encoding="utf-8")
+        must_raise(SystemExit,
+                   lambda: P.convert(base / "src", stranger, ["test_paired"],
+                                     overwrite=True), "not a corpus")
+
+
+def t_primevul_verify_catches_tampering_and_renames():
+    with tempfile.TemporaryDirectory() as td:
+        root = converted_primevul_corpus(Path(td))
+        assert P.verify(root)["rows"] == 8
+
+        edited = next(root.rglob("func.c*"))
+        original = edited.read_text(encoding="utf-8")
+        edited.write_text(original + "// changed\n", encoding="utf-8")
+        must_raise(SystemExit, lambda: P.verify(root), "mismatch")
+        edited.write_text(original, encoding="utf-8")
+
+        missing = next(root.rglob("func_Code.c*"))
+        body = missing.read_text(encoding="utf-8")
+        missing.unlink()
+        must_raise(SystemExit, lambda: P.verify(root), "is missing")
+        missing.write_text(body, encoding="utf-8")
+        assert P.verify(root)["rows"] == 8
+
+    with tempfile.TemporaryDirectory() as td:
+        # Members resolve as root.parent / original_file, so the manifest embeds
+        # the root's name and a rename detaches the corpus from its own labels.
+        root = converted_primevul_corpus(Path(td))
+        renamed = root.with_name("renamed")
+        root.rename(renamed)
+        must_raise(SystemExit, lambda: P.verify(renamed), "must keep the name")
+
+
+def t_split_aware_selection_keeps_the_evaluation_set_whole():
+    """Calibrate on one split, evaluate on another, spend none of the test set.
+
+    Selection is otherwise split-blind, so on a root holding several splits an
+    evaluation would be mostly whichever split is largest -- for the real
+    release, 3785 train pairs against 433 test ones.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = converted_primevul_corpus(
+            Path(td), count=8, splits=("train_paired", "test_paired"))
+        rows = [json.loads(line) for line in
+                (root / P.MANIFEST_NAME).read_text(encoding="utf-8").splitlines()]
+        assert len(rows) == 16
+        split_of = {}
+        for row in rows:
+            for key in ("original_file", "secure_file"):
+                split_of[row[key].split("/", 1)[1]] = row["primevul_split"]
+
+        calib_splits = E.normalise_splits("train_paired")
+        selected = E.sample_calibration_files(root, 6, seed=965, splits=calib_splits)
+        paths = [path for path, _ in selected]
+        assert {split_of[path] for path in paths} == {"train_paired"}
+        assert sum("_Code" in path for path in paths) in (3, 4), "still balanced"
+        assert len({path.rsplit("/", 1)[0] for path in paths}) == len(paths)
+
+        stats = {}
+        pairs = E.load_pairs(root / P.MANIFEST_NAME, root, 8, seed=42, stats=stats,
+                             exclude_relative_paths=set(paths),
+                             splits=E.normalise_splits("test_paired"))
+        assert [pair["split"] for pair in pairs] == ["test_paired"] * 8
+        assert stats["skipped_other_split"] == 8
+        # Disjoint splits mean calibration cost the evaluation set nothing.
+        assert stats["skipped_calibration_overlap"] == 0
+        assert not (set(paths) & {p for pair in pairs
+                                  for p in (pair["vuln_path"], pair["safe_path"])})
+
+        # An empty selection is refused, not reported as "found only 0".
+        must_raise(ValueError,
+                   lambda: E.sample_calibration_files(
+                       root, 2, splits=E.normalise_splits("valid_paired")),
+                   "no calibration candidates")
+        must_raise(ValueError,
+                   lambda: E.load_pairs(root / P.MANIFEST_NAME, root, 1,
+                                        splits=E.normalise_splits("valid_paired")),
+                   "no rows in split")
+
+        # The splits actually profiled are recorded, so a result can say so.
+        record = E._calibration_provenance(
+            selected[:1], [{"path": paths[0], "file_index": 0, "chunk_index": 0,
+                            "n_chunks": 1, "prompt_ids": [1, 2]}],
+            {"forwards": 1, "response_tokens": 1,
+             "generated_responses": [{"run_index": 0, "path": paths[0],
+                                      "file_index": 0, "chunk_index": 0, "tokens": 1,
+                                      "token_ids_sha256": "d" * 64}]},
+            seed=965, temperature=0.0, max_seq_len=64, max_new_tokens=8,
+            max_chunks=0, source_kind="corpus_files", security_prompt=True,
+            corpus=E.corpus_identity(root), splits=calib_splits)
+        E._validate_calibration_provenance(record)
+        assert record["corpus_splits"] == ["train_paired"]
+
+
+def t_split_selection_refuses_a_corpus_that_cannot_honour_it():
+    """A CodeQL corpus has no split labels; asking for one must not match nothing."""
+    manifest = "CODEQL_SECURE_MANIFEST.jsonl"
+    assert E.row_in_splits({"primevul_split": "test_paired"},
+                           ("test_paired",), manifest) is True
+    assert E.row_in_splits({"primevul_split": "train_paired"},
+                           ("test_paired",), manifest) is False
+    assert E.row_in_splits({}, None, manifest) is True, "no request, no filter"
+    must_raise(ValueError,
+               lambda: E.row_in_splits({"alert_locations": 1}, ("test_paired",), manifest),
+               "carry no primevul_split")
+
+    assert E.normalise_splits("") is None and E.normalise_splits(None) is None
+    assert E.normalise_splits("b, a ,b") == ("a", "b"), "deduped and ordered"
+    assert E.normalise_splits(["test_paired"]) == ("test_paired",)
+
+    with tempfile.TemporaryDirectory() as td:
+        # A plain directory corpus has no manifest at all to carry splits.
+        root = Path(td)
+        (root / "CWE-001").mkdir()
+        (root / "CWE-001" / "a.c").write_text("int a;\n", encoding="utf-8")
+        must_raise(ValueError,
+                   lambda: E.sample_calibration_files(
+                       root, 1, splits=E.normalise_splits("test_paired")),
+                   "cannot be honoured")
+
+
+def t_pairs_manifest_must_belong_to_the_calibration_corpus():
+    """The identity gate is worthless if the pairs come from elsewhere.
+
+    corpus_identity digests the manifest discovered under --calib-dir, while
+    load_pairs reads the manifest it is handed. Left unchecked, a score artifact
+    could pass the corpus gate and then be scored on pairs from a manifest it
+    never described.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = converted_primevul_corpus(Path(td))
+        manifest = root / P.MANIFEST_NAME
+        assert E.require_same_corpus_manifest(root, manifest) == manifest
+        # Same corpus, same files, but a hand-cut subset of the rows.
+        subset = root.parent / "subset.jsonl"
+        subset.write_text(
+            "".join(manifest.read_text(encoding="utf-8").splitlines(True)[:2]),
+            encoding="utf-8")
+        must_raise(SystemExit,
+                   lambda: E.require_same_corpus_manifest(root, subset),
+                   "is not the matched-pair manifest")
+        must_raise(SystemExit,
+                   lambda: E.require_same_corpus_manifest(root.parent, manifest),
+                   "found none")
+
+
+def t_primevul_overwrite_replaces_rather_than_merges():
+    """A merged root leaves orphans the manifest cannot see but the digest counts."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        write_primevul(base / "src", primevul_rows(6))
+        root = base / "primevul-c-files"
+        P.convert(base / "src", root, ["test_paired"])
+        assert len(list(root.rglob("func*.c*"))) == 12
+
+        # A different, smaller dataset over the top.
+        write_primevul(base / "src", primevul_rows(2, start=100))
+        P.convert(base / "src", root, ["test_paired"], overwrite=True)
+        listed = set()
+        for line in (root / P.MANIFEST_NAME).read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            listed |= {row["original_file"].split("/", 1)[1],
+                       row["secure_file"].split("/", 1)[1]}
+        on_disk = {path.relative_to(root).as_posix() for path in root.rglob("func*.c*")}
+        assert on_disk == listed, f"orphans left behind: {sorted(on_disk - listed)}"
+        assert len(on_disk) == 4
+        P.verify(root)
+
+
+def t_primevul_rows_must_hash_both_members():
+    """load_pairs only verifies a member's bytes when the row carries its hash."""
+    base = {"ground_truth": E.GROUND_TRUTH_PRIMEVUL, "commit_id": "abc",
+            "original_sha256": "a" * 64, "secure_sha256": "b" * 64}
+    assert E.pair_row_is_labelled(dict(base)) is True
+    for dropped in ("original_sha256", "secure_sha256"):
+        row = dict(base); del row[dropped]
+        must_raise(ValueError, lambda r=row: E.pair_row_is_labelled(r),
+                   "does not hash both members")
+
+
+def t_corpus_suffixes_cover_everything_the_converter_emits():
+    """A suffix the converter writes but calibration skips shrinks the pool silently.
+
+    Such a pair is written, manifested, verified and pair-loaded normally, but
+    _manifest_calibration_candidates drops both members, so the balanced sampler
+    sees fewer pairs than the manifest advertises and can fail with a confusing
+    "too few disjoint" error.
+    """
+    assert P.SOURCE_SUFFIXES <= E.CORPUS_SUFFIXES, \
+        f"converter emits {sorted(P.SOURCE_SUFFIXES - E.CORPUS_SUFFIXES)}, " \
+        "which calibration would skip"
+
+
+def t_primevul_overwrite_never_destroys_an_existing_corpus():
+    """Staging: replace-not-merge must not put the old corpus at risk."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        write_primevul(base / "src", primevul_rows(4))
+        root = base / "primevul-c-files"
+        P.convert(base / "src", root, ["test_paired"])
+        before = P.verify(root)["manifest_sha256"]
+
+        # An abort after staging began must leave the good corpus untouched.
+        must_raise(SystemExit,
+                   lambda: P.convert(base / "src", root, ["test_paired"],
+                                     overwrite=True, max_pairs=99),
+                   "only 4 were usable")
+        assert root.is_dir(), "a failed --overwrite destroyed the existing corpus"
+        assert P.verify(root)["manifest_sha256"] == before
+        assert not list(base.glob("*.converting-*")), "staging residue"
+        assert not list(base.glob("*.replaced-*")), "swap residue"
+
+        # A successful overwrite still replaces, and paths name the real root.
+        write_primevul(base / "src", primevul_rows(2, start=50))
+        P.convert(base / "src", root, ["test_paired"], overwrite=True)
+        assert P.verify(root)["rows"] == 2
+        for line in (root / P.MANIFEST_NAME).read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            assert row["original_file"].startswith("primevul-c-files/"), row["original_file"]
+
+
+def t_primevul_cwe_alias_is_not_shadowed_by_an_empty_field():
+    """The original release ships "cwe": "" -- present, empty, and not a default."""
+    assert P.normalise_cwe({"cwe": "", "cwe_ids": ["CWE-787"]}) == ["CWE-787"]
+    assert P.normalise_cwe({"cwe": [], "cwe_ids": ["CWE-119"]}) == ["CWE-119"]
+    assert P.normalise_cwe({"cwe": ["CWE-20"], "cwe_ids": ["CWE-787"]}) == ["CWE-20"]
+    assert P.normalise_cwe({"cwe_ids": "CWE-416"}) == ["CWE-416"]
+    assert P.normalise_cwe({}) == []
 
 
 def main():

@@ -410,6 +410,160 @@ construction, per-question seeding and row schema rather than keeping a second
 copy that can drift; its `--out` is a directory and it writes the same
 `answers_<tag>.jsonl` plus `summary.json` layout.
 
+## Corpora
+
+Calibration and matched-pair evaluation both draw from a *corpus root*: a
+directory of source files plus one matched-pair manifest binding every member by
+SHA-256. Two corpora exist.
+
+| corpus | manifest | language | ground truth |
+|---|---|---|---|
+| `vulnerable-js-files` | `CODEQL_SECURE_MANIFEST.jsonl` | JS/TS | `codeql_alert_neutralization` |
+| `primevul-c-files` | `PRIMEVUL_PAIRED_MANIFEST.jsonl` | C/C++ | `primevul_commit_pair` |
+
+A CodeQL pair is a flagged file beside the same file with the flagged expression
+neutralised and rescanned clean: ground truth is a scanner's alert and its
+absence. A PrimeVul pair is the pre- and post-fix revision of one function from
+a real vulnerability-fixing commit ([PrimeVul](https://github.com/DLVulDet/PrimeVul),
+ICSE 2025, [arXiv:2403.18624](https://arxiv.org/abs/2403.18624), MIT).
+
+**These are not the same claim, and the difference matters for reading a pair
+result.** PrimeVul's vulnerable member is backed by a shipped fix, which is
+stronger than a scanner alert. Its benign member is *weaker*: the post-fix
+function is only known to lack the vulnerability that commit fixed, not
+certified free of every other one, the way a clean rescan is for that scanner's
+queries. The matched-pair metric grades a binary VULNERABLE/SAFE verdict, so a
+PrimeVul "SAFE" member the model calls VULNERABLE may be a real second bug
+rather than a false positive, and the metric cannot separate those.
+
+Because the two corpora differ in language *and* in what a label means, masks
+calibrated on one are not evidence about the other. Every score artifact records
+a `corpus` identity - the digest of the manifest it was calibrated from - and
+`pairs` refuses an artifact whose corpus does not match the pairs it is about to
+score. That refusal is the point: without it, a cross-corpus run reports what
+looks like a pruning result and is really a corpus-transfer result.
+
+Two constraints the manifest imposes, both inherited by PrimeVul:
+
+- A corpus root carries **exactly one** manifest. Calibration sampling finds it
+  by name rather than being handed one, so two would make the corpus's identity
+  depend on lookup order. Two are refused.
+- Members resolve as `root.parent / original_file`, so the manifest embeds the
+  root's directory name and **renaming a corpus root detaches it from its own
+  manifest**. `primevul_dataset.py verify` diagnoses this explicitly.
+
+### Building the PrimeVul corpus
+
+PrimeVul ships JSONL with the function source inline, which is not the corpus
+contract, so `v4/primevul_dataset.py` materialises it into one. Converting
+rather than adding a second loader is deliberate: balanced calibration sampling
+that never takes both revisions of one function, path-level exclusion of
+calibrated files from the evaluation set, content hashes in the run manifest and
+the fail-closed checks on all of it live in the *consumers*. A parallel loader
+would have to re-earn every one; a converter earns them once.
+
+The data is Google-Drive distributed, so download is manual. Only
+`primevul_*_paired.jsonl` is usable - an unpaired split has no benign
+counterpart. `file_info.json` and `file_contents/` are not used: the pipeline
+reviews a function, not its surrounding file, and whole files would neither fit
+`MAX_SUPPORTED_SEQ_LEN` nor keep the two members identical-except-for-the-fix.
+`primevul_test_paired.jsonl` (435 pairs, ~5.8 MB) is enough to start.
+
+```bash
+python v4/primevul_dataset.py fetch                      # download instructions
+python v4/primevul_dataset.py describe --primevul-dir "$PV"
+python v4/primevul_dataset.py convert  --primevul-dir "$PV" \
+    --out "$EASYEP_DATA_ROOT/primevul-c-files" --split test_paired
+python v4/primevul_dataset.py verify   --root "$EASYEP_DATA_ROOT/primevul-c-files"
+```
+
+Then point the standalone modes at it; the Slurm launcher still hard-codes
+`vulnerable-js-files` and has not been wired for corpus selection yet:
+
+```bash
+--calib-dir "$EASYEP_DATA_ROOT/primevul-c-files" \
+--pairs-manifest "$EASYEP_DATA_ROOT/primevul-c-files/PRIMEVUL_PAIRED_MANIFEST.jsonl"
+```
+
+The converter refuses what it cannot verify rather than repairing it, and checks
+only what the release actually guarantees. Pairing is by adjacent rows, but each
+pair is *verified* - one vulnerable and one benign, both non-empty, source
+differing, vulnerable member naming a commit - because a single misaligned row
+would shift every later label by one and produce a corpus that looks fine.
+Measured over all three paired splits of v0.1 (870 + 7578 + 960 rows), those
+four properties hold universally.
+
+Two properties that look like invariants are **not**, and assuming them was a
+real bug caught against the shipped data: the two members carry different
+`commit_id`s in 19 pairs and different `file_name`s in 13 more, because PrimeVul
+sometimes takes the benign revision from a later commit than the one that
+introduced the flaw. Rejecting those would silently discard real pairs, so they
+are counted into the conversion provenance and printed, not treated as
+corruption. `file_name` is also absent - serialised as the literal string
+`"None"` - for a fifth to a third of rows, which is why the display suffix comes
+from it when present and from a marker heuristic otherwise.
+
+The converter also refuses a split whose rows mix schema variants, records which
+field carried the label instead of guessing silently, de-duplicates functions
+recurring across splits, and rolls back a partially written tree on any abort.
+
+Converting `test_paired` alone yields **433 pairs** (435 minus 2 exact
+duplicates) across 62 CWE strata, members `.c` 320 / `.cc` 69 / `.cpp` 36 /
+`.h` 8, median member 2382 characters and p99 49196. Converting all three splits
+yields **4694 pairs** (3785 train / 476 valid / 433 test, 10 cross-split
+duplicates dropped) across 120 strata in under two seconds. Nothing in
+`test_paired` exceeds the context budget, but the combined root has a 484 KB
+outlier, and `pairs` rejects over-context items rather than truncating and
+reports how many it dropped.
+
+The converted corpus is experiment data: gitignored like
+`deepseek_easy_ep_inputs/`, with only its digest in the run manifest.
+
+### Which split to use for what
+
+Convert **all three paired splits into one root** and select per stage. One root
+keeps the corpus identity single, so calibration and evaluation still agree;
+`--calib-splits` and `--pairs-splits` then decide what each stage draws from.
+
+```bash
+python v4/primevul_dataset.py convert --primevul-dir "$PV" \
+    --out "$EASYEP_DATA_ROOT/primevul-c-files" \
+    --split train_paired --split valid_paired --split test_paired
+```
+
+Recommended: **calibrate on `train_paired`, evaluate on `test_paired`**, and
+keep `valid_paired` for settling `KEEP` or token budgets so the test split stays
+untouched until the final run.
+
+```bash
+... pipeline --calib-dir "$C" --calib-splits train_paired --profile-only ...
+... pairs    --calib-dir "$C" --pairs-splits test_paired \
+             --pairs-manifest "$C/PRIMEVUL_PAIRED_MANIFEST.jsonl" ...
+```
+
+`pairs` takes no `--calib-splits`: it reads the splits it was profiled on back
+from the score artifact's `corpus_splits` and prints them.
+
+The practical reason is that calibration otherwise **spends the evaluation set**:
+every calibration file consumes a pair that matched-pair selection then excludes.
+Drawing calibration from `train_paired` leaves all 433 `test_paired` pairs
+available, and `skipped_calibration_overlap` drops to zero because the splits are
+disjoint by construction. The secondary reason is that `test_paired` is what
+PrimeVul's own paper reports on, so the numbers stay comparable.
+
+Selection is split-blind when no split is named, which on a multi-split root is
+rarely what you want: the real corpus holds 3785 train against 433 test pairs, so
+an unfiltered 200-pair evaluation would be about 90% training data. Naming a
+split a corpus cannot express - the CodeQL tree, or a directory with no manifest
+- is refused rather than silently matching nothing, and the splits actually
+profiled are recorded in the score artifact as `corpus_splits`.
+
+Split separation here is hygiene, not necessity. EASY-EP calibration is
+unsupervised - it profiles which experts route and fits nothing to labels - so
+no trained parameter can memorise a test item, and path-level disjointness is the
+invariant that carries the claim. Splitting makes the result easy to defend
+without a reviewer having to reason about that.
+
 ## Evaluated variants
 
 All variants are decoded under identical per-item seeds:
@@ -515,7 +669,7 @@ evaluating under an optimised runtime, the way the R1 pipeline uses sglang.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 62 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 84 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask
@@ -534,6 +688,16 @@ blinding (including that the matched-pair label is withheld), that no evaluation
 prompt carries the reference answer or grading rubric, the context-window
 ceiling, the checkpoint allowlist, and the inlined `hc_post` algebra used by
 the primary mHC-aware score.
+
+The corpus tests additionally cover the second corpus end to end: that a
+converted PrimeVul root feeds the ordinary calibration and matched-pair loaders
+with no new code path, that a PrimeVul row cannot borrow the CodeQL alert gate
+(and that CodeQL rows still behave exactly as before), that corpus identity
+tracks the manifest and refuses an ambiguous or mixed-ground-truth root, that a
+score artifact is refused against a corpus it was not calibrated on, that
+PrimeVul pairing is verified rather than assumed, and that conversion
+de-duplicates, rolls back on abort and never clobbers a directory it did not
+create.
 
 ## Judging
 

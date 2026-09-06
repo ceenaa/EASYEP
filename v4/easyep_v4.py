@@ -81,6 +81,36 @@ MAX_SUPPORTED_SEQ_LEN = 24576
 # so "reasoning" is not a valid value -- it fails on the first encode.
 THINKING_MODE = "thinking"
 
+# ------------------------------------------------------------------ corpora
+# Calibration sampling and matched-pair loading were written against the CodeQL
+# JavaScript tree and hard-coded its suffixes and manifest name in three places.
+# A second corpus has to enter through the same gates rather than around them,
+# so the contract lives here once.
+# Must stay a superset of primevul_dataset.SOURCE_SUFFIXES: a suffix the
+# converter will emit but this set omits produces pairs that load fine yet are
+# silently skipped by _manifest_calibration_candidates, quietly shrinking the
+# calibration pool below what the manifest advertises.
+CORPUS_SUFFIXES = frozenset({".js", ".ts", ".jsx", ".tsx",
+                             ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"})
+# load_calibration's directory mode additionally accepts prose and Python; it
+# feeds the raw-text (`sample_texts`) path, which no evaluation consumes.
+CALIBRATION_TEXT_SUFFIXES = CORPUS_SUFFIXES | frozenset({".txt", ".md", ".py"})
+# A corpus root carries exactly one matched-pair manifest. Calibration sampling
+# discovers the manifest by name rather than being handed one, so two would make
+# "which pairs describe this corpus" silently order-dependent; that is refused.
+PAIR_MANIFEST_NAMES = ("CODEQL_SECURE_MANIFEST.jsonl",
+                       "PRIMEVUL_PAIRED_MANIFEST.jsonl")
+# What a manifest row's labels are evidence of. A CodeQL row means "the scanner
+# raised alerts on this file and the neutralised copy rescans clean". A PrimeVul
+# row means "a vulnerability-fixing commit touched this function, and the benign
+# member is the post-fix revision". Those are different claims, admitted by
+# different checks, and the row has to say which -- writing alert_locations=1
+# into a PrimeVul row to satisfy the CodeQL gate would launder one into the
+# other, and the resulting corpus would look identical to a scanner-backed one.
+GROUND_TRUTH_CODEQL = "codeql_alert_neutralization"
+GROUND_TRUTH_PRIMEVUL = "primevul_commit_pair"
+GROUND_TRUTH_KINDS = (GROUND_TRUTH_CODEQL, GROUND_TRUTH_PRIMEVUL)
+
 
 @contextmanager
 def deterministic_score_reductions():
@@ -1206,7 +1236,7 @@ def load_calibration(path: Path) -> list[str]:
     if path.is_dir():
         out = []
         for p in sorted(path.rglob("*")):
-            if p.is_file() and p.suffix in {".js", ".ts", ".jsx", ".tsx", ".txt", ".md", ".py"}:
+            if p.is_file() and p.suffix in CALIBRATION_TEXT_SUFFIXES:
                 try:
                     out.append(p.read_text(encoding="utf-8", errors="ignore"))
                 except OSError:
@@ -1434,22 +1464,187 @@ Remediation: concrete fix
 """
 
 
-def _manifest_calibration_candidates(root: Path) -> list[tuple[str, int, Path]]:
+def pair_row_ground_truth(row: dict) -> str:
+    """What kind of evidence backs this manifest row's labels.
+
+    Rows written before a second corpus existed carry no field, and at that time
+    every row was a CodeQL row, so the default preserves their meaning exactly.
+    An unrecognised value is refused rather than defaulted -- guessing here would
+    pick which gate admits the pair.
+    """
+    kind = row.get("ground_truth", GROUND_TRUTH_CODEQL)
+    if kind not in GROUND_TRUTH_KINDS:
+        raise ValueError(f"unknown pair manifest ground_truth: {kind!r}")
+    return kind
+
+
+def pair_row_is_labelled(row: dict) -> bool:
+    """Whether this row's VULNERABLE member is actually evidenced.
+
+    Each ground truth is admitted by the check that means something for it.
+    CodeQL rows must carry at least one alert, or "vulnerable" is just a
+    filename. PrimeVul rows carry no alert count at all: their evidence is that
+    the row names a real fixing commit and that the two members are genuinely
+    different revisions, so those are what is checked. Returning True for a
+    PrimeVul row because someone wrote alert_locations=1 into it would report a
+    scanner finding that never happened.
+    """
+    kind = pair_row_ground_truth(row)
+    if kind == GROUND_TRUTH_CODEQL:
+        try:
+            return int(row.get("alert_locations", 0)) >= 1
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pair manifest has invalid alert_locations") from exc
+    commit = row.get("commit_id")
+    if not isinstance(commit, str) or not commit.strip():
+        raise ValueError("primevul pair manifest row does not name a fixing commit")
+    original, secure = row.get("original_sha256"), row.get("secure_sha256")
+    # Both digests are required, not just the vulnerable one: load_pairs only
+    # verifies a member's bytes when the row carries its hash, so a row missing
+    # secure_sha256 would put an unverified benign member into the evaluation.
+    if not original or not secure:
+        raise ValueError(
+            f"primevul pair for commit {commit} does not hash both members; "
+            "an unhashed member would be used without its bytes being checked")
+    if original == secure:
+        raise ValueError(
+            f"primevul pair for commit {commit} has identical members; "
+            "the benign member must be the post-fix revision, not a copy")
+    return True
+
+
+def row_in_splits(row: dict, splits: tuple[str, ...] | None, source: str) -> bool:
+    """Whether a manifest row belongs to one of the requested dataset splits.
+
+    PrimeVul ships train/valid/test, and drawing calibration from one and
+    evaluation from another keeps the whole evaluation set intact instead of
+    spending part of it on profiling. Selection is otherwise split-blind, which
+    on a root holding several splits would make an evaluation set mostly
+    whichever split is largest -- the opposite of what asking for a split means.
+
+    A corpus whose rows carry no split label cannot honour the request, so that
+    is refused rather than quietly matching nothing.
+    """
+    if not splits:
+        return True
+    value = row.get("primevul_split")
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"{source} was asked for split(s) {', '.join(splits)} but its rows "
+            "carry no primevul_split label. Only a corpus converted by "
+            "v4/primevul_dataset.py records splits.")
+    return value in splits
+
+
+def normalise_splits(splits) -> tuple[str, ...] | None:
+    if not splits:
+        return None
+    if isinstance(splits, str):
+        splits = [part.strip() for part in splits.split(",")]
+    cleaned = tuple(sorted({part for part in splits if part}))
+    return cleaned or None
+
+
+def find_pair_manifest(root: Path) -> Path | None:
+    """The corpus root's single matched-pair manifest, or None."""
+    present = [root / name for name in PAIR_MANIFEST_NAMES if (root / name).is_file()]
+    if len(present) > 1:
+        raise ValueError(
+            f"{root} carries {len(present)} matched-pair manifests "
+            f"({', '.join(path.name for path in present)}); calibration sampling "
+            "discovers the manifest by name, so a corpus must carry exactly one")
+    return present[0] if present else None
+
+
+def require_same_corpus_manifest(calib_dir: Path, pairs_manifest: Path) -> Path:
+    """Require --pairs-manifest to be the manifest of --calib-dir.
+
+    corpus_identity() digests the manifest it *discovers* under the calibration
+    root, but matched-pair selection reads the manifest it is *given*. When
+    those are different files the identity gate attests a corpus other than the
+    one supplying the pairs -- so a score artifact could be accepted against
+    pairs it never described, which is the exact confusion the gate exists to
+    prevent. They also have to agree for calibration-overlap exclusion to mean
+    anything, since that compares paths under this one root.
+    """
+    discovered = find_pair_manifest(calib_dir)
+    given = pairs_manifest.resolve()
+    if discovered is None or discovered.resolve() != given:
+        raise SystemExit(
+            f"--pairs-manifest {given} is not the matched-pair manifest of "
+            f"--calib-dir {calib_dir.resolve()} "
+            f"(found {discovered.resolve() if discovered else 'none'}). Both must "
+            "describe one corpus: the score artifact is checked against the "
+            "calibration root's manifest, and calibration-overlap exclusion "
+            "compares paths under that root.")
+    return discovered
+
+
+def corpus_identity(root: Path) -> dict | None:
+    """Name the corpus a calibration or an evaluation is drawn from.
+
+    Two corpora now feed the same scoring machinery, and a score artifact
+    profiled on one is not evidence about the other: the routing statistics come
+    from a different language and the labels rest on a different definition of
+    "vulnerable". The per-chunk token hashes already bind the exact inputs, but
+    nothing downstream can compare a hash to a corpus, so the identity is
+    recorded explicitly and matched-pair evaluation refuses a cross-corpus
+    artifact instead of silently reporting it as a result about these pairs.
+
+    The manifest is the identity: it enumerates every pair with content hashes,
+    so its digest moves whenever the corpus does. A root with no manifest has no
+    identity to record (None), which is what the raw-text calibration path uses.
+    """
+    manifest = find_pair_manifest(root)
+    if manifest is None:
+        return None
+    rows, kinds = 0, set()
+    digest = hashlib.sha256()
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        kinds.add(pair_row_ground_truth(json.loads(line)))
+        digest.update(line.strip().encode("utf-8") + b"\n")
+        rows += 1
+    if not rows:
+        raise ValueError(f"{manifest} has no matched-pair rows")
+    if len(kinds) != 1:
+        # A mixed corpus would make "what does VULNERABLE mean here" depend on
+        # which rows the sampler happened to draw.
+        raise ValueError(
+            f"{manifest} mixes ground truths ({', '.join(sorted(kinds))}); one "
+            "corpus must make one kind of claim about its labels")
+    return {"corpus_schema_version": 1, "name": root.name,
+            "manifest": manifest.name, "ground_truth": sorted(kinds)[0],
+            "rows": rows, "manifest_sha256": digest.hexdigest()}
+
+
+def describe_corpus(corpus: dict | None) -> str:
+    if not corpus:
+        return "no corpus identity"
+    # "rows", not "pairs": this counts manifest rows, which is what the digest
+    # covers. Rows the label gate rejects are still rows.
+    return (f"{corpus.get('name')} ({corpus.get('ground_truth')}, "
+            f"{corpus.get('rows')} manifest rows, "
+            f"manifest {str(corpus.get('manifest_sha256'))[:12]})")
+
+
+def _manifest_calibration_candidates(
+        root: Path, splits: tuple[str, ...] | None = None) -> list[tuple[str, int, Path]]:
     """Return label, pair index, and path from a validated matched-pair manifest."""
     root = root.resolve()
-    manifest = root / "CODEQL_SECURE_MANIFEST.jsonl"
-    if not manifest.is_file():
+    manifest = find_pair_manifest(root)
+    if manifest is None:
         return []
     candidates = []
     for pair_index, line in enumerate(manifest.read_text(encoding="utf-8").splitlines()):
         if not line.strip():
             continue
         row = json.loads(line)
-        try:
-            if int(row.get("alert_locations", 0)) < 1:
-                continue
-        except (TypeError, ValueError) as exc:
-            raise ValueError("calibration manifest has invalid alert_locations") from exc
+        if not pair_row_is_labelled(row):
+            continue
+        if not row_in_splits(row, splits, str(manifest)):
+            continue
         for label, key, hash_key in (
                 ("vulnerable", "original_file", "original_sha256"),
                 ("secure", "secure_file", "secure_sha256")):
@@ -1458,7 +1653,7 @@ def _manifest_calibration_candidates(root: Path) -> list[tuple[str, int, Path]]:
                 path.relative_to(root.resolve())
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"calibration manifest path escapes the data root: {key}") from exc
-            if path.is_file() and path.suffix in {".js", ".ts", ".jsx", ".tsx"}:
+            if path.is_file() and path.suffix in CORPUS_SUFFIXES:
                 expected = row.get(hash_key)
                 if (not isinstance(expected, str)
                         or re.fullmatch(r"[0-9a-fA-F]{64}", expected) is None
@@ -1469,11 +1664,18 @@ def _manifest_calibration_candidates(root: Path) -> list[tuple[str, int, Path]]:
     return candidates
 
 
-def _balanced_manifest_sample(root: Path, n: int, seed: int) -> list[Path]:
+def _balanced_manifest_sample(root: Path, n: int, seed: int,
+                              splits: tuple[str, ...] | None = None) -> list[Path]:
     """Sample near-equal secure/vulnerable files without taking both sides of a pair."""
     import random
     root = root.resolve()
-    candidates = _manifest_calibration_candidates(root)
+    candidates = _manifest_calibration_candidates(root, splits)
+    if splits and not candidates and find_pair_manifest(root) is not None:
+        # A manifest exists and simply holds nothing in that split -- distinct
+        # from a corpus that cannot express splits at all, which the caller
+        # reports instead.
+        raise ValueError(
+            f"no calibration candidates in {root} for split(s) {', '.join(splits)}")
     if not candidates:
         return []
     rng = random.Random(seed)
@@ -1521,7 +1723,8 @@ def _balanced_manifest_sample(root: Path, n: int, seed: int) -> list[Path]:
     return selected
 
 
-def sample_calibration_files(root: Path, n: int, seed: int = 42) -> list[tuple[str, str]]:
+def sample_calibration_files(root: Path, n: int, seed: int = 42,
+                             splits: tuple[str, ...] | None = None) -> list[tuple[str, str]]:
     """Balanced manifest sample, falling back to deterministic CWE stratification."""
     import random
     root = root.resolve()
@@ -1529,14 +1732,18 @@ def sample_calibration_files(root: Path, n: int, seed: int = 42) -> list[tuple[s
         raise ValueError("n_calib must be positive")
     if not root.is_dir():
         raise ValueError(f"calibration root is not a directory: {root}")
-    balanced = _balanced_manifest_sample(root, n, seed)
+    balanced = _balanced_manifest_sample(root, n, seed, splits)
     if balanced:
         return [(path.relative_to(root).as_posix(),
                  path.read_text(encoding="utf-8", errors="ignore"))
                 for path in balanced]
+    if splits:
+        raise ValueError(
+            f"{root} has no usable matched-pair manifest, so split(s) "
+            f"{', '.join(splits)} cannot be honoured")
     by_cwe: dict[str, list[Path]] = {}
     for f in sorted(root.rglob("*")):
-        if f.is_file() and f.suffix in {".js", ".ts", ".jsx", ".tsx"}:
+        if f.is_file() and f.suffix in CORPUS_SUFFIXES:
             cwe = next((part for part in f.relative_to(root).parts if part.startswith("CWE-")), "other")
             by_cwe.setdefault(cwe, []).append(f)
     n_eligible = sum(len(paths) for paths in by_cwe.values())
@@ -1731,7 +1938,9 @@ def _calibration_provenance(files: list[tuple[str, str]], inputs: list[dict],
                             result: dict, *, seed: int, temperature: float,
                             max_seq_len: int, max_new_tokens: int,
                             max_chunks: int, source_kind: str,
-                            security_prompt: bool) -> dict:
+                            security_prompt: bool,
+                            corpus: dict | None = None,
+                            splits: tuple[str, ...] | None = None) -> dict:
     """Content-bind a reusable score tensor to its calibration trajectory.
 
     source_kind and security_prompt describe the calibration *distribution*.
@@ -1742,9 +1951,25 @@ def _calibration_provenance(files: list[tuple[str, str]], inputs: list[dict],
     """
     if source_kind not in ("corpus_files", "sample_texts"):
         raise ValueError(f"unknown calibration source_kind: {source_kind!r}")
+    # corpus stays optional: a corpus root with no matched-pair manifest has no
+    # identity to record, and sample_calibration_files deliberately supports
+    # such a tree via its CWE-stratified fallback. Refusing here would abort a
+    # legitimate profile-then-evaluate-questions run *after* the calibration,
+    # from inside a rank-0-only branch, hanging the other ranks. Matched-pair
+    # evaluation is the consumer that actually needs the identity, and
+    # _require_evaluation_calibration(require_corpus=...) refuses it there.
     record = {
-        "provenance_schema_version": 1,
+        "provenance_schema_version": 2,
         "source_kind": source_kind,
+        # Which corpus, as opposed to how its sources were addressed. Added in
+        # schema 2; version-1 artifacts predate the second corpus and so are
+        # unambiguously the CodeQL one, but they cannot prove it, which is why
+        # _require_evaluation_calibration refuses them when a corpus is required.
+        "corpus": corpus,
+        # Which dataset splits the sources came from, when the corpus has any.
+        # Splits of one corpus are the same distribution, so this gates nothing;
+        # it is recorded so a result can state what it actually profiled on.
+        "corpus_splits": list(splits) if splits else None,
         "security_prompt": bool(security_prompt),
         # The thinking mode changes what the model emits and therefore which
         # experts route, so it identifies the calibration distribution just as
@@ -1782,7 +2007,8 @@ def _calibration_provenance(files: list[tuple[str, str]], inputs: list[dict],
 
 
 def _require_evaluation_calibration(state: dict, source: str, *,
-                                    need_corpus_paths: bool = False) -> dict:
+                                    need_corpus_paths: bool = False,
+                                    require_corpus: dict | None = None) -> dict:
     """Reject a schema-valid artifact that cannot support an evaluation.
 
     A score artifact can be perfectly well-formed and still be the wrong thing
@@ -1793,7 +2019,11 @@ def _require_evaluation_calibration(state: dict, source: str, *,
     different routing distribution than the security-review prompt these
     evaluations use. need_corpus_paths is for consumers that additionally rely
     on selected_sources naming real corpus files, which today is matched-pair
-    selection excluding the profiled programs.
+    selection excluding the profiled programs. require_corpus is for consumers
+    that draw their own items from a corpus: masks profiled on the CodeQL
+    JavaScript tree say nothing about routing on PrimeVul C/C++ functions, and
+    the reverse, so evaluating one against the other would produce a number that
+    reads like a pruning result and is really a corpus-transfer result.
     """
     calibration = state.get("calibration")
     if not isinstance(calibration, dict):
@@ -1816,13 +2046,39 @@ def _require_evaluation_calibration(state: dict, source: str, *,
             "sources have no corpus paths, so matched-pair selection could not "
             "exclude the profiled files and would report zero overlap while "
             "possibly reusing one. Profile with `pipeline --calib-dir`.")
+    if require_corpus is not None:
+        profiled = calibration.get("corpus")
+        if not isinstance(profiled, dict):
+            raise SystemExit(
+                f"{source} records no corpus identity (provenance schema "
+                f"{calibration.get('provenance_schema_version')}), so it cannot be "
+                f"shown to describe {describe_corpus(require_corpus)}. Artifacts "
+                "written before corpus identity existed predate the second corpus; "
+                "re-profile against the corpus you are evaluating.")
+        if profiled.get("manifest_sha256") != require_corpus.get("manifest_sha256"):
+            raise SystemExit(
+                f"{source} was calibrated on {describe_corpus(profiled)} but this "
+                f"evaluation draws from {describe_corpus(require_corpus)}. The "
+                "masks would come from a different corpus than the items they are "
+                "scored on; re-profile with --calib-dir pointing at this corpus.")
     return calibration
 
 
 def _validate_calibration_provenance(record: Any, source: str = "score artifact") -> None:
     sha = re.compile(r"^[0-9a-f]{64}$")
-    if not isinstance(record, dict) or record.get("provenance_schema_version") != 1:
+    if not isinstance(record, dict) or record.get("provenance_schema_version") not in (1, 2):
         raise SystemExit(f"{source} is missing calibration provenance; re-profile it")
+    if record["provenance_schema_version"] >= 2:
+        corpus = record.get("corpus")
+        if "corpus" not in record or not (corpus is None or isinstance(corpus, dict)):
+            raise SystemExit(
+                f"{source} does not record which corpus it was calibrated on; "
+                "re-profile with this easyep_v4.py")
+        if isinstance(corpus, dict) and (
+                not isinstance(corpus.get("manifest_sha256"), str)
+                or sha.fullmatch(corpus["manifest_sha256"]) is None
+                or corpus.get("ground_truth") not in GROUND_TRUTH_KINDS):
+            raise SystemExit(f"{source} has malformed corpus identity")
     if record.get("source_kind") not in ("corpus_files", "sample_texts"):
         raise SystemExit(
             f"{source} does not record which calibration distribution produced it; "
@@ -2162,13 +2418,19 @@ def all_variants(scores, scores_alt, counts, gate_sums,
 
 def load_pairs(manifest: Path, root: Path, n: int, seed: int = 42,
                accept=None, stats: dict | None = None,
-               exclude_relative_paths: set[str] | None = None) -> list[dict]:
-    """Matched vulnerable/secure file pairs from the CodeQL manifest.
+               exclude_relative_paths: set[str] | None = None,
+               splits: tuple[str, ...] | None = None) -> list[dict]:
+    """Matched vulnerable/secure pairs from a corpus's matched-pair manifest.
 
-    The secure file is the SAME file with the flagged expression neutralised and
-    re-scanned clean, so a model that simply calls everything vulnerable scores
-    100% on one half and 0% on the other. Recall-only metrics cannot see that;
-    this can.
+    Both members are the same program either side of one change, so a model that
+    simply calls everything vulnerable scores 100% on one half and 0% on the
+    other. Recall-only metrics cannot see that; this can.
+
+    What the change is depends on the corpus, and the row says which via
+    pair_row_ground_truth: for the CodeQL tree the secure member is the same
+    file with the flagged expression neutralised and rescanned clean; for
+    PrimeVul it is the post-fix revision from a vulnerability-fixing commit,
+    which evidences the absence of *that* flaw rather than of every flaw.
     """
     import random
     if n < 1:
@@ -2177,7 +2439,17 @@ def load_pairs(manifest: Path, root: Path, n: int, seed: int = 42,
     selection = {"manifest_rows": len(rows), "rows_examined": 0,
                  "skipped_no_alert": 0, "skipped_missing_file": 0,
                  "skipped_unusable_content": 0, "skipped_by_acceptance": 0,
-                 "skipped_calibration_overlap": 0}
+                 "skipped_calibration_overlap": 0, "skipped_other_split": 0}
+    if splits:
+        # Filter before the shuffle so the requested split is the whole
+        # population, not a random slice of every split that sorted early.
+        # Refuse an empty result rather than reporting "found only 0".
+        kept = [row for row in rows if row_in_splits(row, splits, str(manifest))]
+        selection["skipped_other_split"] = len(rows) - len(kept)
+        if not kept:
+            raise ValueError(
+                f"{manifest} has no rows in split(s) {', '.join(splits)}")
+        rows = kept
     rng = random.Random(seed)
     rng.shuffle(rows)
     root = root.resolve()
@@ -2186,10 +2458,11 @@ def load_pairs(manifest: Path, root: Path, n: int, seed: int = 42,
     out = []
     for r in rows:
         selection["rows_examined"] += 1
-        # Ground truth here is "CodeQL raised alerts on this file, and the
-        # neutralised copy rescans clean" -- not a human exploitability judgement.
-        # Require actual alerts so the vulnerable label means something.
-        if int(r.get("alert_locations", 0)) < 1:
+        # The row says what its labels are evidence of, and each kind is
+        # admitted by the check that means something for it -- CodeQL alerts for
+        # a scanner-neutralised pair, a named fixing commit for a PrimeVul one.
+        # Neither is a human exploitability judgement; see pair_row_is_labelled.
+        if not pair_row_is_labelled(r):
             selection["skipped_no_alert"] += 1
             continue
         try:
@@ -2221,7 +2494,9 @@ def load_pairs(manifest: Path, root: Path, n: int, seed: int = 42,
             selection["skipped_unusable_content"] += 1
             continue
         candidate = {"pair_id": len(out), "queries": r.get("queries", []),
-                     "alert_locations": int(r.get("alert_locations", 0)),
+                     "ground_truth": pair_row_ground_truth(r),
+                     "split": r.get("primevul_split"),
+                     "alert_locations": int(r.get("alert_locations", 0) or 0),
                      "vuln_path": r["original_file"], "vuln_code": vc,
                      "safe_path": r["secure_file"], "safe_code": sc,
                      "original_sha256": r.get("original_sha256"),
@@ -2426,19 +2701,28 @@ def cmd_pairs(a) -> None:
         return True
 
     selection = {}
+    require_same_corpus_manifest(Path(a.calib_dir), Path(a.pairs_manifest))
+    pair_corpus = corpus_identity(Path(a.calib_dir))
     calibration = _require_evaluation_calibration(
-        st, a.scores_in, need_corpus_paths=True)
+        st, a.scores_in, need_corpus_paths=True, require_corpus=pair_corpus)
     calibration_paths = {
         str(item["path"]) for item in calibration["selected_sources"]
     }
+    pair_splits = normalise_splits(getattr(a, "pairs_splits", None))
     pairs = load_pairs(
         Path(a.pairs_manifest), Path(a.calib_dir), a.n_pairs, a.seed,
         accept=pair_fits, stats=selection,
-        exclude_relative_paths=calibration_paths)
+        exclude_relative_paths=calibration_paths, splits=pair_splits)
+    say(f"corpus: {describe_corpus(pair_corpus)}"
+        + (f", splits {', '.join(pair_splits)}" if pair_splits else ""))
+    profiled_splits = calibration.get("corpus_splits")
+    if profiled_splits:
+        say(f"calibrated on split(s) {', '.join(profiled_splits)}")
     say(f"{len(pairs)} matched pairs -> {2*len(pairs)} items per variant")
     say(f"pair selection examined {selection['rows_examined']} rows; skipped "
-        f"{selection['skipped_by_acceptance']} over-context and "
-        f"{selection['skipped_calibration_overlap']} calibration-overlap pairs")
+        f"{selection['skipped_by_acceptance']} over-context, "
+        f"{selection['skipped_calibration_overlap']} calibration-overlap and "
+        f"{selection['skipped_other_split']} other-split pairs")
     say(f"variants: {', '.join(t for t, _ in variants)}")
 
     items = _pair_eval_items(pairs)
@@ -2949,7 +3233,8 @@ def cmd_validate(a) -> None:
         if rank == 0:
             print(f"[easyep] {m}", flush=True)
 
-    files = sample_calibration_files(Path(a.calib_dir), a.n_calib, a.seed)
+    files = sample_calibration_files(Path(a.calib_dir), a.n_calib, a.seed,
+                                     normalise_splits(getattr(a, "calib_splits", None)))
     inputs = _calibration_chunks(
         files, tok, encode_messages, a.max_seq_len, a.max_new_tokens, a.max_chunks)
     say(f"validating norm recovery on {len(files)} files / {len(inputs)} chunks "
@@ -3105,10 +3390,14 @@ def cmd_pipeline(a) -> None:
                     (out / f"mask_{tag}.json").write_text(json.dumps(m, indent=1))
         return _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                          encode_messages, generate, variants)
-    files = sample_calibration_files(Path(a.calib_dir), a.n_calib, a.seed)
+    corpus = corpus_identity(Path(a.calib_dir))
+    calib_splits = normalise_splits(getattr(a, "calib_splits", None))
+    files = sample_calibration_files(Path(a.calib_dir), a.n_calib, a.seed, calib_splits)
     inputs = _calibration_chunks(
         files, tok, encode_messages, a.max_seq_len, a.max_new_tokens, a.max_chunks)
     say(f"phase 1: profiling {len(files)} calibration files / {len(inputs)} chunks")
+    say(f"         corpus: {describe_corpus(corpus)}"
+        + (f", splits {', '.join(calib_splits)}" if calib_splits else ""))
     t0 = time.time()
     cal = _run_calibration(
         model, inputs, generate, tok.eos_token_id, prof, a.max_seq_len,
@@ -3126,7 +3415,8 @@ def cmd_pipeline(a) -> None:
             max_chunks=a.max_chunks,
             # real corpus-relative paths, profiled through the same
             # security-review prompt the evaluation uses
-            source_kind="corpus_files", security_prompt=True)
+            source_kind="corpus_files", security_prompt=True, corpus=corpus,
+            splits=calib_splits)
         torch.save(state, out / "expert_scores.pt")
 
     # ---------------- phase 2: mask ----------------
@@ -3368,6 +3658,11 @@ def main() -> None:
     sp = sub.add_parser("pipeline", help="profile -> mask -> eval(full) -> eval(pruned), one load")
     common(sp)
     sp.add_argument("--calib-dir", required=True)
+    sp.add_argument("--calib-splits", default="",
+                    help="comma-separated dataset splits to draw calibration from "
+                         "(e.g. train_paired). Only a corpus converted by "
+                         "v4/primevul_dataset.py labels its splits; omit to draw "
+                         "from the whole corpus")
     sp.add_argument("--questions", required=True)
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-calib", type=int, default=25)
@@ -3394,7 +3689,12 @@ def main() -> None:
     common(sp)
     sp.add_argument("--scores-in", required=True)
     sp.add_argument("--pairs-manifest", required=True)
-    sp.add_argument("--calib-dir", required=True, help="root of vulnerable-js-files")
+    sp.add_argument("--calib-dir", required=True,
+                    help="corpus root the pairs and the calibration both live under")
+    sp.add_argument("--pairs-splits", default="",
+                    help="comma-separated dataset splits to draw matched pairs from, "
+                         "e.g. \"test_paired\". Keeps the evaluation set intact when "
+                         "calibration was profiled from another split")
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-pairs", type=int, default=25)
     sp.add_argument("--keep", type=int, default=128)
@@ -3425,6 +3725,11 @@ def main() -> None:
     sp = sub.add_parser("validate", help="check unweighted-norm recovery against explicit forwards")
     common(sp)
     sp.add_argument("--calib-dir", required=True)
+    sp.add_argument("--calib-splits", default="",
+                    help="comma-separated dataset splits to draw calibration from "
+                         "(e.g. train_paired). Only a corpus converted by "
+                         "v4/primevul_dataset.py labels its splits; omit to draw "
+                         "from the whole corpus")
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=128)
