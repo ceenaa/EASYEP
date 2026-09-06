@@ -3291,6 +3291,59 @@ def cmd_parity(a) -> None:
         raise SystemExit("parity check failed - instrumentation changes the model")
 
 
+def norm_recovery_cutoff_report(rec, tru, n_hash: int, n_layers: int,
+                                n_experts: int, cutoffs, fail_under: float,
+                                error_samples_per_layer):
+    """Agreement between recovered and explicit norms, at every mask cutoff.
+
+    The recovered norm is ``||w*out||/w``, exact only in exact arithmetic; V4
+    applies the routing weight before ``w2``, whose FP4 path quantises, so the
+    shortcut can drift. What matters is not the drift but whether it changes the
+    expert selection -- and that has a different answer at every cutoff. Top-KEEP
+    set agreement says nothing about ordering *inside* that set, so a deeper cut
+    can disagree sharply while the baseline reads as a clean pass. Every cutoff
+    that will build a mask is therefore gated on its own.
+    """
+    if not cutoffs:
+        raise ValueError("norm recovery report needs at least one keep cutoff")
+    report_rows, spearmans = [], []
+    per_cutoff = {keep: [] for keep in cutoffs}
+    for lid in range(n_hash, n_layers):
+        recovered_order = torch.argsort(rec[lid], descending=True).tolist()
+        explicit_order = torch.argsort(tru[lid], descending=True).tolist()
+        ra = torch.argsort(torch.argsort(rec[lid], descending=True)).float()
+        rb = torch.argsort(torch.argsort(tru[lid], descending=True)).float()
+        spearman = torch.corrcoef(torch.stack([ra, rb]))[0, 1].item()
+        entry = {"layer": lid, "spearman": round(spearman, 6),
+                 "norm_error_samples": error_samples_per_layer[lid]}
+        for keep in cutoffs:
+            shared = len(set(recovered_order[:keep]) & set(explicit_order[:keep]))
+            per_cutoff[keep].append(shared)
+            entry[f"overlap_keep{keep}"] = shared
+            entry[f"overlap_frac_keep{keep}"] = round(shared / keep, 4)
+        report_rows.append(entry)
+        spearmans.append(spearman)
+
+    summary, passed = {}, True
+    for keep in cutoffs:
+        shared_counts = per_cutoff[keep]
+        fractions = [shared / keep for shared in shared_counts]
+        keep_ok = all(fraction >= fail_under for fraction in fractions)
+        passed = passed and keep_ok
+        summary[str(keep)] = {
+            "keep": keep,
+            "pruning_fraction": round(1 - keep / n_experts, 4),
+            "mean": sum(shared_counts) / len(shared_counts),
+            "min": min(shared_counts), "max": max(shared_counts),
+            "mean_frac": round(sum(shared_counts) / len(shared_counts) / keep, 4),
+            "min_frac": round(min(fractions), 4),
+            "n_layers_identical": sum(1 for s in shared_counts if s == keep),
+            "pass": keep_ok,
+        }
+    failed = [keep for keep in cutoffs if not summary[str(keep)]["pass"]]
+    return report_rows, spearmans, per_cutoff, summary, passed, failed
+
+
 def cmd_validate(a) -> None:
     """Test the unweighted-norm recovery against explicit unweighted forwards.
 
@@ -3356,25 +3409,25 @@ def cmd_validate(a) -> None:
             + ", ".join(map(str, missing_error_layers)))
     if sum(error_samples_per_layer) != err.numel():
         raise RuntimeError("distributed norm-error samples/counts are inconsistent")
-    rows, ov_all, sp_all = [], [], []
-    for lid in range(n_hash, n_layers):
-        a_top = set(torch.argsort(rec[lid], descending=True)[: a.keep].tolist())
-        b_top = set(torch.argsort(tru[lid], descending=True)[: a.keep].tolist())
-        ov = len(a_top & b_top)
-        ra = torch.argsort(torch.argsort(rec[lid], descending=True)).float()
-        rb = torch.argsort(torch.argsort(tru[lid], descending=True)).float()
-        sp = torch.corrcoef(torch.stack([ra, rb]))[0, 1].item()
-        rows.append({"layer": lid, "overlap": ov, "overlap_frac": round(ov / a.keep, 4),
-                     "spearman": round(sp, 6),
-                     "norm_error_samples": error_samples_per_layer[lid]})
-        ov_all.append(ov); sp_all.append(sp)
-
-    exact_fracs = [overlap / a.keep for overlap in ov_all]
+    # Gate every cutoff that will actually build a mask, not just the baseline.
+    sweep = parse_keep_sweep(getattr(a, "keep_sweep", ""), args.n_routed_experts,
+                             args.n_activated_experts, a.keep)
+    cutoffs = sorted({a.keep, *sweep}, reverse=True)
+    rows, sp_all, overlaps, by_keep, ok, failed_cutoffs = norm_recovery_cutoff_report(
+        rec, tru, n_hash, n_layers, args.n_routed_experts, cutoffs,
+        a.fail_under, error_samples_per_layer)
+    for row in rows:
+        # Baseline keys kept unprefixed so existing norm_validation.json readers
+        # still resolve.
+        row["overlap"] = row[f"overlap_keep{a.keep}"]
+        row["overlap_frac"] = row[f"overlap_frac_keep{a.keep}"]
+    ov_all = overlaps[a.keep]
+    exact_fracs = [ov / a.keep for ov in ov_all]
     min_frac = min(exact_fracs)
-    ok = all(frac >= a.fail_under for frac in exact_fracs)
     report = {
         "score_schema_version": SCORE_SCHEMA_VERSION,
-        "keep": a.keep, "n_error_samples": int(err.numel()),
+        "keep": a.keep, "keep_cutoffs": cutoffs,
+        "n_error_samples": int(err.numel()),
         "calibration": {"files": len(files), "chunks": len(inputs), **cal},
         "norm_error_sampling": {
             "method": "first observations within an equal per-layer/per-rank cap",
@@ -3388,9 +3441,11 @@ def cmd_validate(a) -> None:
                          "min": min(ov_all), "max": max(ov_all),
                          "mean_frac": round(sum(ov_all) / len(ov_all) / a.keep, 4),
                          "n_layers_identical": sum(1 for o in ov_all if o == a.keep)},
+        "topk_overlap_by_keep": by_keep,
         "spearman_full_ranking": {"mean": sum(sp_all) / len(sp_all), "min": min(sp_all)},
         "per_layer": rows,
-        "pass_rule": "every prunable layer must meet fail_under",
+        "pass_rule": "every prunable layer must meet fail_under at every keep cutoff",
+        "failed_cutoffs": failed_cutoffs,
         "pass": ok,
         "fail_under": a.fail_under,
     }
@@ -3404,16 +3459,21 @@ def cmd_validate(a) -> None:
     say("NORM RECOVERY VALIDATION   ||w*out||/w   vs   explicit ||out||")
     say(f"  relative norm error   median {pct[0]:.3e}  p90 {pct[1]:.3e}  "
         f"p99 {pct[2]:.3e}  max {pct[3]:.3e}   (n={err.numel()})")
-    say(f"  top-{a.keep} overlap      mean {report['topk_overlap']['mean']:.2f}/{a.keep} "
-        f"({report['topk_overlap']['mean_frac']:.2%})  min {min(ov_all)}  "
-        f"identical on {report['topk_overlap']['n_layers_identical']}/{len(ov_all)} layers")
+    for keep in cutoffs:
+        stat = by_keep[str(keep)]
+        say(f"  top-{keep:<4d} overlap    mean {stat['mean']:.2f}/{keep} "
+            f"({stat['mean_frac']:.2%})  worst layer {stat['min_frac']:.4f}  "
+            f"prune {stat['pruning_fraction']:.1%}  "
+            f"{'PASS' if stat['pass'] else 'FAIL'}")
     say(f"  full-ranking spearman mean {report['spearman_full_ranking']['mean']:.6f}  "
         f"min {report['spearman_full_ranking']['min']:.6f}")
     say("=" * 68)
 
+    worst = min(by_keep.values(), key=lambda s: s["min_frac"])
     say(f"NORM VALIDATION {'PASS' if ok else 'FAIL'}  "
-        f"(worst-layer top-{a.keep} overlap {min_frac:.4f}, "
-        f"required >= {a.fail_under})")
+        f"(worst cutoff top-{worst['keep']} worst-layer overlap {worst['min_frac']:.4f}, "
+        f"required >= {a.fail_under}"
+        + (f"; failing cutoffs: {failed_cutoffs}" if failed_cutoffs else "") + ")")
     if world_size > 1:
         dist.destroy_process_group()
     if not ok:
@@ -3839,6 +3899,9 @@ def main() -> None:
     sp.add_argument("--seed", type=int, default=965)
     sp.add_argument("--temperature", type=float, default=0.0,
                     help="calibration-response temperature; default 0 uses greedy decoding")
+    sp.add_argument("--keep-sweep", default="",
+                    help="also gate these keep cutoffs; a mask built at a cutoff "
+                         "this gate never checked is not validated")
     sp.add_argument("--fail-under", type=float, default=0.98,
                     help="fail if the recovered-norm top-k overlap with explicit "
                          "unweighted norms falls below this fraction")

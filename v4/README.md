@@ -647,10 +647,19 @@ Of 256 experts:
 | 70% | 77 | `pruned_paper_keep77` |
 | 75% | 64 | `pruned_paper_keep64` |
 
+`--export` is itself a comma-separated list of assignments, so a comma-bearing
+value cannot go inside it: Slurm would read `KEEP_SWEEP=115` and then treat
+`102`, `90`, `77`, `64` as separate variable names. Export it in the shell and
+submit with `--export=ALL`:
+
 ```bash
-sbatch --account=YOUR_ALLOCATION --export=ALL,RUN_ID=sweep_001,RESUME=0,KEEP_SWEEP=115,102,90,77,64 \
-  v4/easyep.sbatch
+export KEEP_SWEEP=115,102,90,77,64
+env -u RUN_ID -u RESUME sbatch --account=YOUR_ALLOCATION \
+  --export=ALL,RUN_ID=sweep_001,RESUME=0 v4/easyep.sbatch
 ```
+
+The launcher rejects a `KEEP_SWEEP` that is not comma-separated integers, so a
+value mangled this way fails loudly rather than silently sweeping one level.
 
 Only the primary score is swept. The controls stay at the `KEEP` baseline because
 they answer a different question -- *does the scoring carry signal at all* -- and

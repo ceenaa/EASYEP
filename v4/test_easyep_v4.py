@@ -2800,6 +2800,51 @@ def t_keep_sweep_appends_variants_without_disturbing_the_baseline():
     assert [t for t, _ in same] == base_tags
 
 
+def t_norm_recovery_gate_catches_a_deeper_cutoff_the_baseline_hides():
+    # The failure the baseline-only gate could not see: recovered and explicit
+    # norms agree perfectly on the top-10 SET while disagreeing completely on the
+    # ordering inside it, so the top-5 mask is built on unvalidated recovery.
+    n_l, n_e, n_hash = 3, 20, 0
+    rec = torch.zeros(n_l, n_e)
+    tru = torch.zeros(n_l, n_e)
+    for lid in range(n_l):
+        for e in range(n_e):
+            # explicit: 0 is best, 19 worst
+            tru[lid, e] = 200.0 - e
+            # recovered: same top-10 members, reversed among themselves
+            rec[lid, e] = (100.0 + e) if e < 10 else (50.0 - e)
+    samples = [7] * n_l
+
+    rows, sp, per_cutoff, by_keep, ok, failed = E.norm_recovery_cutoff_report(
+        rec, tru, n_hash, n_l, n_e, [10, 5], 0.98, samples)
+
+    assert by_keep["10"]["pass"] is True, by_keep["10"]
+    assert by_keep["10"]["min_frac"] == 1.0, by_keep["10"]
+    # top-5 shares nothing, so the mask at that depth is not validated
+    assert by_keep["5"]["pass"] is False, by_keep["5"]
+    assert by_keep["5"]["min_frac"] == 0.0, by_keep["5"]
+    assert ok is False and failed == [5], (ok, failed)
+    # the pruning depth is reported alongside, so a failure names the rate
+    assert by_keep["5"]["pruning_fraction"] == 0.75, by_keep["5"]
+    # per-layer rows carry every cutoff, not just the baseline
+    assert rows[0]["overlap_keep10"] == 10 and rows[0]["overlap_keep5"] == 0, rows[0]
+
+
+def t_norm_recovery_gate_passes_when_every_cutoff_agrees():
+    n_l, n_e, n_hash = 3, 20, 0
+    scores = torch.zeros(n_l, n_e)
+    for lid in range(n_l):
+        for e in range(n_e):
+            scores[lid, e] = 200.0 - e
+    rows, sp, per_cutoff, by_keep, ok, failed = E.norm_recovery_cutoff_report(
+        scores, scores.clone(), n_hash, n_l, n_e, [10, 5, 2], 0.98, [3] * n_l)
+    assert ok is True and failed == [], (ok, failed)
+    for keep in ("10", "5", "2"):
+        assert by_keep[keep]["pass"] is True and by_keep[keep]["min_frac"] == 1.0
+    must_raise(ValueError, lambda: E.norm_recovery_cutoff_report(
+        scores, scores, n_hash, n_l, n_e, [], 0.98, [3] * n_l), "at least one")
+
+
 def main():
     print("easyep_v4 logic tests\n")
     for name, fn in sorted(globals().items()):

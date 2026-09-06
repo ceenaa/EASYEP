@@ -505,6 +505,7 @@ run_stage validate "$OUT/norm_validation" "$OUT/parity" -- validate "${COMMON[@]
   "${TEMPERATURE_ARGS[@]}" \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
   --out "$OUT/norm_validation" --n-calib "$N_CALIB" --keep "$KEEP" \
+  --keep-sweep "$KEEP_SWEEP" \
   --max-new-tokens "$MAX_NEW_TOKENS" --max-chunks "$MAX_CHUNKS" \
   --seed "$SEED"
 
