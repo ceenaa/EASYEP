@@ -2393,10 +2393,42 @@ def build_random_mask(n_layers: int, n_experts: int, keep_n: int, n_hash: int, s
     return mask
 
 
+def parse_keep_sweep(value, n_experts: int, topk: int | None,
+                     baseline: int) -> tuple:
+    """Extra keep levels for a pruning-rate sweep, de-duplicated and ordered.
+
+    A mask is the top-K of a score tensor that does not itself depend on K, so
+    one calibration pass serves every level. Sweeping costs generation time
+    only -- never a re-profile -- which is why the levels are a list here
+    rather than separate runs that would each re-derive the same statistics.
+
+    The baseline keep is dropped if repeated: it is already ``pruned_paper``,
+    and emitting it twice would decode the identical mask under two labels.
+    """
+    if value in (None, "", ()):
+        return ()
+    items = ([part.strip() for part in value.split(",") if part.strip()]
+             if isinstance(value, str) else list(value))
+    keeps: list[int] = []
+    for item in items:
+        if isinstance(item, bool):
+            raise ValueError("keep-sweep values must be integers")
+        try:
+            keep = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"keep-sweep value {item!r} is not an integer") from exc
+        _validate_keep(keep, n_experts, topk)
+        if keep != baseline and keep not in keeps:
+            keeps.append(keep)
+    # Descending keep == ascending pruning, so the reported order reads as a
+    # monotone sweep regardless of how the caller listed them.
+    return tuple(sorted(keeps, reverse=True))
+
+
 def all_variants(scores, scores_alt, counts, gate_sums,
                  keep_n, n_hash, n_layers, n_experts,
                  seed: int, controls: bool, scores_mhc=None,
-                 scores_reduced_legacy=None):
+                 scores_reduced_legacy=None, keep_sweep=()):
     """The variant set, in a fixed order so runs stay comparable.
 
     ``pruned_paper`` is the architecture-aware schema-v2 score. The old reduced
@@ -2437,6 +2469,14 @@ def all_variants(scores, scores_alt, counts, gate_sums,
         v.append(("pruned_gating", build_gating_mask(gate_sums, keep_n, n_hash)))
         v.append(("pruned_frequency", build_frequency_mask(counts, keep_n, n_hash)))
         v.append(("pruned_random", build_random_mask(n_layers, n_experts, keep_n, n_hash, seed)))
+    # Pruning-rate sweep, appended last so the baseline variant order -- and
+    # therefore comparability with earlier runs -- is unchanged.
+    for keep in keep_sweep:
+        if keep == keep_n:
+            continue
+        _validate_scores(scores, keep, n_hash)
+        v.append((f"pruned_paper_keep{keep}",
+                  build_mask_from_scores(scores, keep, n_hash, score_key="score")))
     return v
 
 
@@ -2709,12 +2749,15 @@ def cmd_pairs(a) -> None:
         raise ValueError("score artifact gate top-k does not match model config")
     _validate_keep(a.keep, args.n_routed_experts, args.n_activated_experts)
     _validate_score_state_observations(st, args.n_hash_layers)
+    sweep = parse_keep_sweep(getattr(a, "keep_sweep", ""), args.n_routed_experts,
+                             args.n_activated_experts, a.keep)
     variants = all_variants(st["score"], st["score_no_simibr"],
                             st["counts"], st["gate_sums"],
                             a.keep, args.n_hash_layers,
                             args.n_layers, args.n_routed_experts,
                             a.seed, not a.no_controls,
-                            st.get("score_mhc"), st.get("score_reduced_legacy"))
+                            st.get("score_mhc"), st.get("score_reduced_legacy"),
+                            keep_sweep=sweep)
     input_limit = a.max_seq_len - a.max_new_tokens
     if a.max_new_tokens < 1 or input_limit < 1:
         raise ValueError("max_seq_len leaves no room for matched-pair generation")
@@ -3424,12 +3467,15 @@ def cmd_pipeline(a) -> None:
         # Every mask below is built from these scores, so the calibration
         # distribution has to match this evaluation.
         _require_evaluation_calibration(st, a.scores_in)
+        sweep = parse_keep_sweep(getattr(a, "keep_sweep", ""), args.n_routed_experts,
+                                 args.n_activated_experts, a.keep)
         variants = all_variants(st["score"], st["score_no_simibr"],
                                 st["counts"], st["gate_sums"],
                                 a.keep, args.n_hash_layers,
                                 args.n_layers, args.n_routed_experts,
                                 a.seed, not a.no_controls,
-                                st.get("score_mhc"), st.get("score_reduced_legacy"))
+                                st.get("score_mhc"), st.get("score_reduced_legacy"),
+                                keep_sweep=sweep)
         say(f"phases 1-2 skipped; masks rebuilt from {a.scores_in}")
         say(f"variants: {', '.join(t for t, _ in variants)}")
         if rank == 0:
@@ -3472,11 +3518,13 @@ def cmd_pipeline(a) -> None:
     scores_alt = prof.score_no_simibr.cpu()
     mask = build_mask_from_scores(scores, a.keep, args.n_hash_layers)
     mask_alt = build_mask_from_scores(scores_alt, a.keep, args.n_hash_layers)
+    sweep = parse_keep_sweep(getattr(a, "keep_sweep", ""), args.n_routed_experts,
+                             args.n_activated_experts, a.keep)
     variants = all_variants(
         scores, scores_alt, prof.counts.cpu(), prof.gate_sums.cpu(), a.keep,
         args.n_hash_layers, args.n_layers, args.n_routed_experts,
         a.seed, not a.no_controls, prof.score_mhc.cpu(),
-        prof.score_reduced_legacy.cpu())
+        prof.score_reduced_legacy.cpu(), keep_sweep=sweep)
     if rank == 0:
         (out / ("mask_keep%d.json" % a.keep)).write_text(json.dumps(mask, indent=1))
         (out / ("mask_keep%d_no_simibr.json" % a.keep)).write_text(json.dumps(mask_alt, indent=1))
@@ -3727,6 +3775,8 @@ def main() -> None:
                          "an exceeded positive cap fails rather than dropping source")
     sp.add_argument("--profile-only", action="store_true",
                     help="stop after producing scores and masks (no generation)")
+    sp.add_argument("--keep-sweep", default="",
+                    help='comma-separated extra keep counts for a pruning-rate sweep, e.g. "115,102,90,77,64" for 55/60/65/70/75%% pruning of 256 experts. Masks are rebuilt from the same score artifact, so a sweep costs generation time only and never a re-profile.')
     sp.add_argument("--seed", type=int, default=965,
                     help="question i is decoded with manual_seed(seed+i) in both variants")
     sp.add_argument("--temperature", type=float, default=0.0,
@@ -3746,6 +3796,7 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-pairs", type=int, default=25)
     sp.add_argument("--keep", type=int, default=128)
+    sp.add_argument("--keep-sweep", default="", help='comma-separated extra keep counts for a pruning-rate sweep, e.g. "115,102,90,77,64" for 55/60/65/70/75%% pruning of 256 experts. Masks are rebuilt from the same score artifact, so a sweep costs generation time only and never a re-profile.')
     sp.add_argument("--max-new-tokens", type=int, default=1024,
                     help="response-token limit; default 1024 leaves room for the short verdict format")
     sp.add_argument("--seed", type=int, default=965)

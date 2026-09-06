@@ -2729,6 +2729,77 @@ def t_split_requests_reject_every_unknown_name_not_just_all_of_them():
         assert E.require_known_splits({"a", "b"}, None, "src") is None
 
 
+def t_keep_sweep_parses_orders_and_deduplicates():
+    # 256 experts, top-6 routing, baseline keep 128 (50% pruning)
+    parse = E.parse_keep_sweep
+    assert parse("", 256, 6, 128) == ()
+    assert parse(None, 256, 6, 128) == ()
+    # the percentages this sweep exists for: 55/60/65/70/75% of 256
+    assert parse("115,102,90,77,64", 256, 6, 128) == (115, 102, 90, 77, 64)
+    # listed out of order -> still descending keep, i.e. ascending pruning
+    assert parse("64, 115 ,90", 256, 6, 128) == (115, 90, 64)
+    # the baseline is already pruned_paper; repeating it would decode the same
+    # mask twice under two labels
+    assert parse("128,115", 256, 6, 128) == (115,)
+    assert parse("115,115,102", 256, 6, 128) == (115, 102)
+    # a list of ints is accepted as well as a comma string
+    assert parse([115, 102], 256, 6, 128) == (115, 102)
+
+
+def t_keep_sweep_rejects_invalid_values():
+    parse = E.parse_keep_sweep
+    must_raise(ValueError, lambda: parse("115,abc", 256, 6, 128), "not an integer")
+    must_raise(ValueError, lambda: parse([True], 256, 6, 128), "integers")
+    # below the router's top-k: the gate could not fill its k slots
+    must_raise(ValueError, lambda: parse("4", 256, 6, 128), "")
+    # more experts than exist
+    must_raise(ValueError, lambda: parse("300", 256, 6, 128), "")
+    must_raise(ValueError, lambda: parse("0", 256, 6, 128), "")
+
+
+def t_keep_sweep_appends_variants_without_disturbing_the_baseline():
+    n_l, n_e, keep, n_hash = 5, 20, 8, 1
+
+    def scores_for(experts, *, integer=False):
+        dtype = torch.int64 if integer else torch.float32
+        out = torch.zeros(n_l, n_e, dtype=dtype)
+        for rank, expert in enumerate(experts):
+            out[:, expert] = 100 - rank
+        return out
+
+    ranked = list(range(n_e))
+    sc = scores_for(ranked)
+    alt = scores_for(list(reversed(ranked)))
+    counts = scores_for(ranked, integer=True)
+    gate_sums = scores_for(ranked)
+
+    baseline = E.all_variants(sc, alt, counts, gate_sums, keep, n_hash, n_l, n_e,
+                              965, True, scores_mhc=sc.clone())
+    swept = E.all_variants(sc, alt, counts, gate_sums, keep, n_hash, n_l, n_e,
+                           965, True, scores_mhc=sc.clone(), keep_sweep=(6, 4))
+
+    base_tags = [t for t, _ in baseline]
+    swept_tags = [t for t, _ in swept]
+    # existing order is untouched, so a sweep stays comparable with older runs
+    assert swept_tags[:len(base_tags)] == base_tags, swept_tags
+    assert swept_tags[len(base_tags):] == ["pruned_paper_keep6", "pruned_paper_keep4"], swept_tags
+
+    by_tag = dict(swept)
+    # each swept level keeps exactly that many experts per prunable layer
+    for keep_n in (6, 4):
+        mask = by_tag[f"pruned_paper_keep{keep_n}"]
+        assert mask["keep_per_layer"] == keep_n, mask["keep_per_layer"]
+        for lid in range(n_hash, n_l):
+            kept = mask["layers"][str(lid)]["kept"]
+            assert len(kept) == keep_n, (lid, kept)
+            # a deeper prune must be a subset of a shallower one: same ranking
+            assert set(kept) <= set(by_tag["pruned_paper"]["layers"][str(lid)]["kept"])
+    # a sweep value equal to the baseline is dropped rather than duplicated
+    same = E.all_variants(sc, alt, counts, gate_sums, keep, n_hash, n_l, n_e,
+                          965, True, scores_mhc=sc.clone(), keep_sweep=(keep,))
+    assert [t for t, _ in same] == base_tags
+
+
 def main():
     print("easyep_v4 logic tests\n")
     for name, fn in sorted(globals().items()):

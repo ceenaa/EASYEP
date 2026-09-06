@@ -72,6 +72,11 @@ if [[ $MODEL_ID != "$PINNED_MODEL_ID" || $MODEL_REVISION != "$PINNED_REVISION" |
 fi
 
 KEEP=${KEEP:-128}
+# Extra pruning levels, evaluated from the SAME score artifact -- a mask is the
+# top-K of a score tensor that does not depend on K, so a sweep costs generation
+# time only and never a re-profile. Of 256 experts: 115/102/90/77/64 are
+# 55/60/65/70/75% pruning against the 128 (50%) baseline.
+KEEP_SWEEP=${KEEP_SWEEP:-}
 N_CALIB=${N_CALIB:-25}
 N_PAIRS=${N_PAIRS:-25}
 # NOT the config's original_seq_len=65536.  That is the model's trained context,
@@ -143,6 +148,10 @@ require_uint() {
 }
 
 require_uint KEEP "$KEEP" 6 256
+if [[ -n $KEEP_SWEEP && ! $KEEP_SWEEP =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+  echo "ABORT: KEEP_SWEEP must be comma-separated integers, got '$KEEP_SWEEP'" >&2
+  exit 2
+fi
 require_uint N_CALIB "$N_CALIB" 1
 require_uint N_PAIRS "$N_PAIRS" 1
 # Ceiling, not taste: the unblocked ~16*T^2 prefill transient reaches 11.0 GiB
@@ -347,6 +356,7 @@ MANIFEST_ARGS=(init --manifest "$OUT/RUN_MANIFEST.json" --repo "$REPO"
   --venv "$VENV" --git-sha "$GIT_SHA" --git-tracked-dirty "$GIT_TRACKED_DIRTY"
   --model-id "$MODEL_ID" --model-revision "$MODEL_REVISION"
   --inference-revision "$INFERENCE_REVISION" --keep "$KEEP" --n-calib "$N_CALIB"
+  --keep-sweep "$KEEP_SWEEP"
   --n-pairs "$N_PAIRS" --max-seq-len "$MAX_SEQ_LEN"
   --max-new-tokens "$MAX_NEW_TOKENS" --pair-max-new-tokens "$PAIR_MAX_NEW_TOKENS"
   --max-chunks "$MAX_CHUNKS" --question-limit "$LIMIT" --seed "$SEED"
@@ -504,6 +514,7 @@ run_stage profile "$OUT/scores" "$OUT/parity" "$OUT/norm_validation" -- \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
   --questions "$DATA_ROOT/questions_used.json" \
   --out "$OUT/scores" --n-calib "$N_CALIB" --keep "$KEEP" \
+  --keep-sweep "$KEEP_SWEEP" \
   --max-new-tokens "$MAX_NEW_TOKENS" --max-chunks "$MAX_CHUNKS" \
   --seed "$SEED" --profile-only
 
@@ -512,7 +523,7 @@ run_stage eval "$OUT/questions" "$OUT/scores/expert_scores.pt" -- \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
   --questions "$DATA_ROOT/questions_used.json" \
   --scores-in "$OUT/scores/expert_scores.pt" \
-  --out "$OUT/questions" --keep "$KEEP" --seed "$SEED" \
+  --out "$OUT/questions" --keep "$KEEP" --keep-sweep "$KEEP_SWEEP" --seed "$SEED" \
   --limit "$LIMIT" \
   --max-new-tokens "$MAX_NEW_TOKENS"
 
@@ -521,7 +532,8 @@ run_stage pairs "$OUT/pairs" "$OUT/scores/expert_scores.pt" -- \
   --scores-in "$OUT/scores/expert_scores.pt" \
   --pairs-manifest "$DATA_ROOT/vulnerable-js-files/CODEQL_SECURE_MANIFEST.jsonl" \
   --calib-dir "$DATA_ROOT/vulnerable-js-files" \
-  --out "$OUT/pairs" --n-pairs "$N_PAIRS" --keep "$KEEP" --seed "$SEED" \
+  --out "$OUT/pairs" --n-pairs "$N_PAIRS" --keep "$KEEP" \
+  --keep-sweep "$KEEP_SWEEP" --seed "$SEED" \
   --max-new-tokens "$PAIR_MAX_NEW_TOKENS"
 
 # Re-running blind draws a fresh label assignment, which would invalidate the

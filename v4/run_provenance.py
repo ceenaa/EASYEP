@@ -24,7 +24,7 @@ import tempfile
 from typing import Any
 
 
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 STAGE_SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -208,6 +208,10 @@ def build_provenance(a: argparse.Namespace) -> dict[str, Any]:
             "pair_max_new_tokens": a.pair_max_new_tokens,
             "validate_n_calib": a.n_calib, "max_chunks": a.max_chunks,
             "question_limit": a.question_limit, "seed": a.seed,
+            # Extra pruning levels evaluated from the same score artifact. It
+            # changes which variants are decoded, so it belongs in the immutable
+            # record rather than only in the stage commands.
+            "keep_sweep": a.keep_sweep or "",
             "temperature": a.temperature, "nproc_per_node": a.nproc_per_node,
         },
     }
@@ -471,6 +475,7 @@ def parser() -> argparse.ArgumentParser:
                  "pair_max_new_tokens", "max_chunks", "question_limit", "seed",
                  "nproc_per_node"):
         init.add_argument(f"--{name.replace('_', '-')}", type=int, required=True)
+    init.add_argument("--keep-sweep", default="")
     init.add_argument("--temperature", type=float)
     init.add_argument("--resume", action="store_true")
     init.set_defaults(func=cmd_init)

@@ -267,7 +267,8 @@ The main environment overrides are:
 
 | variable | default | meaning |
 |---|---:|---|
-| `KEEP` | `128` | experts retained in each prunable layer |
+| `KEEP` | `128` | experts retained in each prunable layer (128/256 = 50% pruning) |
+| `KEEP_SWEEP` | empty | comma-separated extra keep levels evaluated from the **same** score artifact, e.g. `115,102,90,77,64` for 55/60/65/70/75% pruning |
 | `N_CALIB` | `25` | calibration source files; token-exact chunking may produce more profiling trajectories |
 | `N_PAIRS` | `25` | matched vulnerable/secure pairs |
 | `MAX_SEQ_LEN` | `16384` | context window used by each stage. Not the config's `original_seq_len=65536`: prefill memory is quadratic and unblocked (~`16*T^2` bytes) against ~35 GiB of headroom, so 65536 OOMs and 24576 is the ceiling, enforced by both the launcher and `build()`. Token-exact chunking preserves whole sources, so a smaller window costs no coverage |
@@ -585,6 +586,7 @@ All variants are decoded under identical per-item seeds:
 | `pruned_gating` | top-`KEEP` by total activated gate weight - the paper's gating-score baseline |
 | `pruned_frequency` | top-`KEEP` by selection count - the naive heuristic |
 | `pruned_random` | seeded random `KEEP` - the floor |
+| `pruned_paper_keep<K>` | the primary score at each extra `KEEP_SWEEP` level |
 
 These are the paper's three pruning controls. `pruned_gating` tests whether output
 norms and token contribution improve on router weights alone. `pruned_frequency`
@@ -624,6 +626,43 @@ that considers `Verdict: SAFE` before settling on `Verdict: VULNERABLE` would
 otherwise read as two conflicting verdicts and score as an abstention. The full
 completion is still stored and still goes to the judge; `answer` is recorded
 beside it.
+
+### Pruning-rate sweep
+
+`KEEP` sets one pruning level; `KEEP_SWEEP` adds more. A mask is the top-`K` of a
+score tensor that does not itself depend on `K`, so **every level is served by the
+same calibration pass** -- a sweep costs generation time only and never a
+re-profile. That is why the levels are a list rather than separate runs, which
+would each re-derive identical statistics and add calibration variance between
+the points being compared.
+
+Of 256 experts:
+
+| pruning | `KEEP` | variant |
+|---:|---:|---|
+| 50% | 128 | `pruned_paper` (baseline, carries the controls) |
+| 55% | 115 | `pruned_paper_keep115` |
+| 60% | 102 | `pruned_paper_keep102` |
+| 65% | 90 | `pruned_paper_keep90` |
+| 70% | 77 | `pruned_paper_keep77` |
+| 75% | 64 | `pruned_paper_keep64` |
+
+```bash
+sbatch --account=YOUR_ALLOCATION --export=ALL,RUN_ID=sweep_001,RESUME=0,KEEP_SWEEP=115,102,90,77,64 \
+  v4/easyep.sbatch
+```
+
+Only the primary score is swept. The controls stay at the `KEEP` baseline because
+they answer a different question -- *does the scoring carry signal at all* -- and
+repeating them per level multiplies decode cost without adding evidence. Sweep
+entries are appended after the baseline variants, so variant order and
+comparability with earlier runs are unchanged, and a level equal to `KEEP` is
+dropped rather than decoded twice under two labels.
+
+Cost scales with the variant count: each added level is another full pass over
+the question set, which at the measured decode rate is the dominant term in the
+job's wall time. Size `KEEP_SWEEP` against the walltime the queue will actually
+grant.
 
 `score_comparison.json` shows where the primary and no-`simibr` rules disagree;
 running both measures whether the token-contribution term helps. The standalone
