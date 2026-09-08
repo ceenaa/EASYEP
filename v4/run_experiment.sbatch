@@ -58,6 +58,11 @@ VENV=${EASYEP_VENV:-${SMALL:+$SMALL/venv}}
 scratch_default=${SCRATCH:-/scratch/${USER:-unknown}}
 DATA_ROOT=${EASYEP_DATA_ROOT:-${DATA:-$scratch_default/deepseek_easy_ep/inputs}}
 RESULTS_ROOT=${EASYEP_RESULTS_ROOT:-$scratch_default/deepseek_easy_ep/results}
+CORPUS=${EASYEP_CORPUS_DIR:-$DATA_ROOT/vulnerable-js-files}
+PAIRS_MANIFEST=${EASYEP_PAIRS_MANIFEST:-$CORPUS/CODEQL_SECURE_MANIFEST.jsonl}
+QUESTIONS=${EASYEP_QUESTIONS:-$DATA_ROOT/questions_used.json}
+CALIB_SPLITS=${CALIB_SPLITS:-}
+PAIR_SPLITS=${PAIR_SPLITS:-}
 
 # This instrumentation was reviewed against one immutable official snapshot.
 PINNED_MODEL_ID=deepseek-ai/DeepSeek-V4-Flash-0731
@@ -92,8 +97,8 @@ MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384}
 # eval would never reach its "Verdict:" line and every row would score as an
 # abstention. These are estimates -- measure completion_tokens in the first run
 # and tighten them, because they dominate the wall time.
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-2048}
-PAIR_MAX_NEW_TOKENS=${PAIR_MAX_NEW_TOKENS:-1024}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
+PAIR_MAX_NEW_TOKENS=${PAIR_MAX_NEW_TOKENS:-8192}
 MAX_CHUNKS=${MAX_CHUNKS:-0}
 # Rehearsal knob. N_CALIB and N_PAIRS already shrink profiling and the pair
 # eval; the question eval had no equivalent, and it is the largest single
@@ -106,6 +111,7 @@ SEED=${SEED:-965}
 # a repeated-seed robustness study.
 TEMPERATURE=${TEMPERATURE:-0}
 NPROC_PER_NODE=${NPROC_PER_NODE:-4}
+FULL_CHECKPOINT_VERIFY=${FULL_CHECKPOINT_VERIFY:-0}
 
 if [[ -n ${RUN_ID:-} ]]; then
   run_id=$RUN_ID
@@ -163,6 +169,7 @@ require_uint MAX_CHUNKS "$MAX_CHUNKS" 0
 require_uint LIMIT "$LIMIT" 0
 require_uint SEED "$SEED" 0
 require_uint NPROC_PER_NODE "$NPROC_PER_NODE" 4 4
+require_uint FULL_CHECKPOINT_VERIFY "$FULL_CHECKPOINT_VERIFY" 0 1
 if (( MAX_NEW_TOKENS >= MAX_SEQ_LEN || PAIR_MAX_NEW_TOKENS >= MAX_SEQ_LEN )); then
   echo "ABORT: response-token limits must be smaller than MAX_SEQ_LEN." >&2
   exit 2
@@ -182,6 +189,15 @@ require_absolute EASYEP_VENV "$VENV"
 require_absolute EASYEP_DATA_ROOT "$DATA_ROOT"
 require_absolute EASYEP_RESULTS_ROOT "$RESULTS_ROOT"
 require_absolute EASYEP_CONFIG "$CONFIG"
+require_absolute EASYEP_CORPUS_DIR "$CORPUS"
+require_absolute EASYEP_PAIRS_MANIFEST "$PAIRS_MANIFEST"
+require_absolute EASYEP_QUESTIONS "$QUESTIONS"
+for split_value in "$CALIB_SPLITS" "$PAIR_SPLITS"; do
+  if [[ -n $split_value && ! $split_value =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]; then
+    echo "ABORT: split lists must be comma-separated identifiers: $split_value" >&2
+    exit 2
+  fi
+done
 require_dir "$REPO"
 require_file "$SCRIPT"
 require_file "$CONFIG"
@@ -189,6 +205,7 @@ require_file "$REPO/v4/easyep.sbatch"
 require_file "$REPO/v4/requirements-v4.txt"
 require_file "$REPO/v4/checkpoint_provenance.py"
 require_file "$REPO/v4/run_provenance.py"
+require_file "$REPO/v4/primevul_dataset.py"
 require_dir "$CODE"
 CODE=$(cd -P "$CODE" && pwd -P)
 SOURCE_SNAPSHOT=$(cd -P "$CODE/.." && pwd -P)
@@ -202,9 +219,12 @@ require_file "$CKPT/tokenizer_config.json"
 require_file "$CHECKPOINT_PROVENANCE"
 require_file "$VENV/bin/python"
 require_file "$VENV/bin/torchrun"
-require_dir "$DATA_ROOT/vulnerable-js-files"
-require_file "$DATA_ROOT/questions_used.json"
-require_file "$DATA_ROOT/vulnerable-js-files/CODEQL_SECURE_MANIFEST.jsonl"
+require_dir "$CORPUS"
+require_file "$QUESTIONS"
+require_file "$PAIRS_MANIFEST"
+if [[ $(basename "$PAIRS_MANIFEST") == PRIMEVUL_PAIRED_MANIFEST.jsonl ]]; then
+  "$VENV/bin/python" "$REPO/v4/primevul_dataset.py" verify --root "$CORPUS"
+fi
 
 shopt -s nullglob
 checkpoint_shards=("$CKPT"/model*-mp"$NPROC_PER_NODE".safetensors)
@@ -279,11 +299,13 @@ fi
 # The provenance sidecar contains full SHA-256 hashes made once after conversion.
 # Routine launches compare its declarations and exact shard metadata; use the
 # utility's `verify --full` mode whenever a fresh byte-for-byte audit is desired.
-"$VENV/bin/python" "$REPO/v4/checkpoint_provenance.py" verify \
+CHECKPOINT_VERIFY_ARGS=(verify \
   --checkpoint "$CKPT" --manifest "$CHECKPOINT_PROVENANCE" \
   --config "$CONFIG" --source-snapshot "$SOURCE_SNAPSHOT" \
   --model-id "$MODEL_ID" --model-revision "$MODEL_REVISION" \
-  --inference-revision "$INFERENCE_REVISION" --nproc "$NPROC_PER_NODE"
+  --inference-revision "$INFERENCE_REVISION" --nproc "$NPROC_PER_NODE")
+[[ $FULL_CHECKPOINT_VERIFY == 0 ]] || CHECKPOINT_VERIFY_ARGS+=(--full)
+"$VENV/bin/python" "$REPO/v4/checkpoint_provenance.py" "${CHECKPOINT_VERIFY_ARGS[@]}"
 
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
@@ -353,10 +375,13 @@ MANIFEST_ARGS=(init --manifest "$OUT/RUN_MANIFEST.json" --repo "$REPO"
   --script "$SCRIPT" --entrypoint "${BASH_SOURCE[0]}" --config "$CONFIG"
   --code "$CODE" --checkpoint "$CKPT"
   --checkpoint-provenance "$CHECKPOINT_PROVENANCE" --data-root "$DATA_ROOT"
+  --questions "$QUESTIONS" --pair-manifest "$PAIRS_MANIFEST" --corpus "$CORPUS"
   --venv "$VENV" --git-sha "$GIT_SHA" --git-tracked-dirty "$GIT_TRACKED_DIRTY"
   --model-id "$MODEL_ID" --model-revision "$MODEL_REVISION"
   --inference-revision "$INFERENCE_REVISION" --keep "$KEEP" --n-calib "$N_CALIB"
   --keep-sweep "$KEEP_SWEEP"
+  --calibration-splits "$CALIB_SPLITS" --pair-splits "$PAIR_SPLITS"
+  --full-checkpoint-verify "$FULL_CHECKPOINT_VERIFY"
   --n-pairs "$N_PAIRS" --max-seq-len "$MAX_SEQ_LEN"
   --max-new-tokens "$MAX_NEW_TOKENS" --pair-max-new-tokens "$PAIR_MAX_NEW_TOKENS"
   --max-chunks "$MAX_CHUNKS" --question-limit "$LIMIT" --seed "$SEED"
@@ -410,6 +435,9 @@ echo " config     $CONFIG"
 echo " code       $CODE"
 echo " checkpoint $CKPT"
 echo " data       $DATA_ROOT"
+echo " corpus     $CORPUS"
+echo " pairs      $PAIRS_MANIFEST"
+echo " splits     calibration=${CALIB_SPLITS:-all} pairs=${PAIR_SPLITS:-all}"
 echo " out        $OUT"
 echo "================================================================"
 
@@ -498,12 +526,16 @@ COMMON=(--ckpt-path "$CKPT" --config "$CONFIG" --code-dir "$CODE"
         --max-seq-len "$MAX_SEQ_LEN")
 TEMPERATURE_ARGS=()
 [[ -z $TEMPERATURE ]] || TEMPERATURE_ARGS=(--temperature "$TEMPERATURE")
+CALIB_SPLIT_ARGS=()
+[[ -z $CALIB_SPLITS ]] || CALIB_SPLIT_ARGS=(--calib-splits "$CALIB_SPLITS")
+PAIR_SPLIT_ARGS=()
+[[ -z $PAIR_SPLITS ]] || PAIR_SPLIT_ARGS=(--pairs-splits "$PAIR_SPLITS")
 
 # Both correctness gates are mandatory and stop the job on failure.
 run_stage parity "$OUT/parity" -- parity "${COMMON[@]}" --out "$OUT/parity"
 run_stage validate "$OUT/norm_validation" "$OUT/parity" -- validate "${COMMON[@]}" \
   "${TEMPERATURE_ARGS[@]}" \
-  --calib-dir "$DATA_ROOT/vulnerable-js-files" \
+  --calib-dir "$CORPUS" "${CALIB_SPLIT_ARGS[@]}" \
   --out "$OUT/norm_validation" --n-calib "$N_CALIB" --keep "$KEEP" \
   --keep-sweep "$KEEP_SWEEP" \
   --max-new-tokens "$MAX_NEW_TOKENS" --max-chunks "$MAX_CHUNKS" \
@@ -512,8 +544,8 @@ run_stage validate "$OUT/norm_validation" "$OUT/parity" -- validate "${COMMON[@]
 # Profile once and reuse exactly that score tensor for both evaluation suites.
 run_stage profile "$OUT/scores" "$OUT/parity" "$OUT/norm_validation" -- \
   pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
-  --calib-dir "$DATA_ROOT/vulnerable-js-files" \
-  --questions "$DATA_ROOT/questions_used.json" \
+  --calib-dir "$CORPUS" "${CALIB_SPLIT_ARGS[@]}" \
+  --questions "$QUESTIONS" \
   --out "$OUT/scores" --n-calib "$N_CALIB" --keep "$KEEP" \
   --keep-sweep "$KEEP_SWEEP" \
   --max-new-tokens "$MAX_NEW_TOKENS" --max-chunks "$MAX_CHUNKS" \
@@ -521,18 +553,20 @@ run_stage profile "$OUT/scores" "$OUT/parity" "$OUT/norm_validation" -- \
 
 run_stage eval "$OUT/questions" "$OUT/scores/expert_scores.pt" -- \
   pipeline "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
-  --calib-dir "$DATA_ROOT/vulnerable-js-files" \
-  --questions "$DATA_ROOT/questions_used.json" \
+  --calib-dir "$CORPUS" "${CALIB_SPLIT_ARGS[@]}" \
+  --questions "$QUESTIONS" \
   --scores-in "$OUT/scores/expert_scores.pt" \
   --out "$OUT/questions" --keep "$KEEP" --keep-sweep "$KEEP_SWEEP" --seed "$SEED" \
   --limit "$LIMIT" \
   --max-new-tokens "$MAX_NEW_TOKENS"
 
-run_stage pairs "$OUT/pairs" "$OUT/scores/expert_scores.pt" -- \
+run_stage pairs "$OUT/pairs" "$OUT/scores/expert_scores.pt" \
+  "$OUT/parity/parity.json" -- \
   pairs "${COMMON[@]}" "${TEMPERATURE_ARGS[@]}" \
   --scores-in "$OUT/scores/expert_scores.pt" \
-  --pairs-manifest "$DATA_ROOT/vulnerable-js-files/CODEQL_SECURE_MANIFEST.jsonl" \
-  --calib-dir "$DATA_ROOT/vulnerable-js-files" \
+  --parity-report "$OUT/parity/parity.json" \
+  --pairs-manifest "$PAIRS_MANIFEST" \
+  --calib-dir "$CORPUS" "${PAIR_SPLIT_ARGS[@]}" \
   --out "$OUT/pairs" --n-pairs "$N_PAIRS" --keep "$KEEP" \
   --keep-sweep "$KEEP_SWEEP" --seed "$SEED" \
   --max-new-tokens "$PAIR_MAX_NEW_TOKENS"
@@ -541,7 +575,7 @@ run_stage pairs "$OUT/pairs" "$OUT/scores/expert_scores.pt" -- \
 # key any in-flight grading is holding. Content-bound markers make skipping safe.
 run_local_stage blind_questions "$OUT/judge/questions" "$OUT/questions" \
   "$VENV/bin/python" "$SCRIPT" blind --results "$OUT/questions" \
-  --questions "$DATA_ROOT/questions_used.json" --out "$OUT/judge/questions"
+  --questions "$QUESTIONS" --out "$OUT/judge/questions"
 run_local_stage blind_pairs "$OUT/judge/pairs" "$OUT/pairs" \
   "$VENV/bin/python" "$SCRIPT" blind --results "$OUT/pairs" --pairs \
   --out "$OUT/judge/pairs"

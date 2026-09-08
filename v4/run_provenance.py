@@ -24,7 +24,7 @@ import tempfile
 from typing import Any
 
 
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
 STAGE_SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -156,6 +156,15 @@ def build_provenance(a: argparse.Namespace) -> dict[str, Any]:
     code = Path(a.code).resolve()
     checkpoint = Path(a.checkpoint).resolve()
     data_root = Path(a.data_root).resolve()
+    questions = Path(a.questions).resolve()
+    pair_manifest = Path(a.pair_manifest).resolve()
+    corpus = Path(a.corpus).resolve()
+    for label, path in (("questions", questions), ("pair manifest", pair_manifest),
+                        ("corpus", corpus)):
+        try:
+            path.relative_to(data_root)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be under data root {data_root}: {path}") from exc
     sidecar_record = _runtime_file("checkpoint_provenance", a.checkpoint_provenance)
     sidecar = json.loads(Path(a.checkpoint_provenance).read_text(encoding="utf-8"))
     if _runtime_file("checkpoint_provenance", a.checkpoint_provenance) != sidecar_record:
@@ -174,6 +183,7 @@ def build_provenance(a: argparse.Namespace) -> dict[str, Any]:
         _runtime_file("requirements", repo / "v4/requirements-v4.txt"),
         _runtime_file("checkpoint_helper", repo / "v4/checkpoint_provenance.py"),
         _runtime_file("run_provenance_helper", repo / "v4/run_provenance.py"),
+        _runtime_file("primevul_dataset_helper", repo / "v4/primevul_dataset.py"),
         sidecar_record,
         _runtime_file("tokenizer", checkpoint / "tokenizer.json"),
         _runtime_file("tokenizer_config", checkpoint / "tokenizer_config.json"),
@@ -196,10 +206,9 @@ def build_provenance(a: argparse.Namespace) -> dict[str, Any]:
             "checkpoint_layout": checkpoint_layout(checkpoint, a.nproc_per_node),
         },
         "inputs": {
-            "questions": digest_file(data_root / "questions_used.json"),
-            "pair_manifest": digest_file(
-                data_root / "vulnerable-js-files/CODEQL_SECURE_MANIFEST.jsonl"),
-            "calibration_and_pair_tree": digest_tree(data_root / "vulnerable-js-files"),
+            "questions": digest_file(questions),
+            "pair_manifest": digest_file(pair_manifest),
+            "calibration_and_pair_tree": digest_tree(corpus),
         },
         "environment": environment_record(a.venv),
         "parameters": {
@@ -213,6 +222,9 @@ def build_provenance(a: argparse.Namespace) -> dict[str, Any]:
             # record rather than only in the stage commands.
             "keep_sweep": a.keep_sweep or "",
             "temperature": a.temperature, "nproc_per_node": a.nproc_per_node,
+            "calibration_splits": a.calibration_splits or "",
+            "pair_splits": a.pair_splits or "",
+            "full_checkpoint_verify": bool(a.full_checkpoint_verify),
         },
     }
 
@@ -467,15 +479,18 @@ def parser() -> argparse.ArgumentParser:
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init")
     for name in ("manifest", "repo", "script", "entrypoint", "config", "code",
-                 "checkpoint", "checkpoint_provenance", "data_root", "venv",
+                 "checkpoint", "checkpoint_provenance", "data_root", "questions",
+                 "pair_manifest", "corpus", "venv",
                  "git_sha", "git_tracked_dirty", "model_id", "model_revision",
                  "inference_revision", "attempt_started_utc"):
         init.add_argument(f"--{name.replace('_', '-')}", required=True)
     for name in ("keep", "n_calib", "n_pairs", "max_seq_len", "max_new_tokens",
                  "pair_max_new_tokens", "max_chunks", "question_limit", "seed",
-                 "nproc_per_node"):
+                 "nproc_per_node", "full_checkpoint_verify"):
         init.add_argument(f"--{name.replace('_', '-')}", type=int, required=True)
     init.add_argument("--keep-sweep", default="")
+    init.add_argument("--calibration-splits", default="")
+    init.add_argument("--pair-splits", default="")
     init.add_argument("--temperature", type=float)
     init.add_argument("--resume", action="store_true")
     init.set_defaults(func=cmd_init)

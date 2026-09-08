@@ -124,6 +124,33 @@ def fixture_calibration_provenance():
     }
 
 
+def t_parity_report_is_passing_and_bound_to_the_exact_model():
+    identity = fixture_model_identity()
+    digest = E._validate_model_identity_record(identity, "fixture")
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "parity.json"
+        path.write_text(json.dumps({"pass": True,
+                                    "model_identity_sha256": digest}))
+        assert E.require_passing_parity_report(path, identity)["pass"] is True
+
+        path.write_text(json.dumps({"pass": False,
+                                    "model_identity_sha256": digest}))
+        must_raise(SystemExit,
+                   lambda: E.require_passing_parity_report(path, identity),
+                   "passing parity")
+
+        path.write_text(json.dumps({"pass": True,
+                                    "model_identity_sha256": "f" * 64}))
+        must_raise(SystemExit,
+                   lambda: E.require_passing_parity_report(path, identity),
+                   "different model")
+
+        path.write_text("not json")
+        must_raise(SystemExit,
+                   lambda: E.require_passing_parity_report(path, identity),
+                   "valid parity report")
+
+
 def t_cutoff_diagnostics_expose_an_arbitrary_tie_break():
     """An integer ranking ties at the cut and topk resolves it by index."""
     n_layers, n_experts, keep, n_hash = 3, 8, 4, 1
@@ -202,9 +229,8 @@ def t_verdict_is_read_from_the_answer_not_the_reasoning():
     text, extracted = E.final_message(parse_message, trace + answer)
     assert extracted is True and E.parse_verdict(text) == "VULNERABLE"
 
-    # a parser that fails, returns nothing usable, or hands back a dict all
-    # degrade to the raw completion rather than losing the row -- and say so,
-    # because a silent total fallback is indistinguishable from working
+    # A parser that fails still preserves the raw completion for diagnosis, but
+    # the fail-closed verdict helper must never classify that reasoning trace.
     def boom(_c, thinking_mode):
         raise RuntimeError("encoding module changed shape")
     assert E.final_message(boom, answer) == (answer, False)
@@ -212,13 +238,19 @@ def t_verdict_is_read_from_the_answer_not_the_reasoning():
     assert E.final_message(
         lambda c, thinking_mode: {"content": answer}, "x") == (answer, True)
     assert E.final_message(lambda c, thinking_mode: 42, answer) == (answer, False)
+    assert E.extracted_verdict(answer, False) is None
+    assert E.extracted_verdict(answer, True) == "VULNERABLE"
 
     # and the summary surfaces how often extraction actually worked
     rows = [{"truth": "VULNERABLE", "verdict": "VULNERABLE", "completion": "c",
-             "answer": "a", "answer_extracted": False},
+             "answer": "a", "answer_extracted": False,
+             "generation_limit_reached": True},
             {"truth": "SAFE", "verdict": "SAFE", "completion": "c",
              "answer": "a", "answer_extracted": True}]
-    assert E.discrimination_stats(rows)["answer_extraction_rate"] == 0.5
+    report = E.discrimination_stats(rows)
+    assert report["answer_extraction_rate"] == 0.5
+    assert report["generation_limit_reached"] == 1
+    assert report["quality_metrics_valid"] is False
 
 
 def t_every_prompt_uses_one_thinking_mode():
@@ -309,6 +341,14 @@ def t_calibration_provenance_records_its_distribution():
     must_raise(SystemExit,
                lambda: E._validate_calibration_provenance(dropped),
                "thinking mode")
+
+    truncated = json.loads(json.dumps(good))
+    truncated["generated_responses"][0]["tokens"] = \
+        truncated["parameters"]["max_new_tokens"]
+    truncated["response_tokens"] = truncated["generated_responses"][0]["tokens"]
+    E._validate_calibration_provenance(truncated)
+    must_raise(SystemExit, lambda: E._require_evaluation_calibration(
+        {"calibration": truncated}, "fixture"), "exhausted")
 
     samples = json.loads(json.dumps(good)); samples["source_kind"] = "sample_texts"
     # usable for the question evaluation, not for matched-pair exclusion
@@ -892,6 +932,32 @@ def t_unparsed_counted():
     d = E.discrimination_stats(rows)
     assert d["unparsed_verdicts"] == 3
     assert d["n_vulnerable"] == 3 and d["n_safe"] == 2
+
+
+def t_matched_pair_outcomes_are_exhaustive_and_penalise_abstention():
+    rows = []
+    outcomes = [
+        ("VULNERABLE", "SAFE"),        # P-C
+        ("VULNERABLE", "VULNERABLE"),  # P-V
+        ("SAFE", "SAFE"),              # P-B
+        ("SAFE", "VULNERABLE"),        # P-R
+        (None, "SAFE"),                 # P-U
+    ]
+    for pair_id, (vulnerable, safe) in enumerate(outcomes):
+        rows.extend((
+            {"pair_id": pair_id, "truth": "VULNERABLE", "verdict": vulnerable},
+            {"pair_id": pair_id, "truth": "SAFE", "verdict": safe},
+        ))
+    report = E.paired_discrimination_stats(rows)
+    assert report["n_pairs"] == 5 and report["complete_pairs"] == 4
+    assert report["pair_coverage"] == 0.8
+    assert report["pair_accuracy"] == 0.2
+    assert report["parsed_only_pair_accuracy"] == 0.25
+    assert {name: item["count"] for name, item in report["categories"].items()} == {
+        "P-C": 1, "P-V": 1, "P-B": 1, "P-R": 1, "P-U": 1,
+    }
+    must_raise(ValueError, lambda: E.paired_discrimination_stats(rows[:-1]),
+               "both labels")
 
 
 def t_abstentions_cannot_score_as_correct():
@@ -1869,7 +1935,7 @@ def t_calibration_profiles_prompt_and_generated_response_once():
     assert profiler.enabled is False
 
 
-def t_calibration_drops_only_synthetic_budget_overflow_eos():
+def t_calibration_rejects_a_budget_exhausted_reasoning_trajectory():
     prompt_ids = list(range(10))
     inputs = [{"prompt_ids": prompt_ids, "path": "x.js", "file_index": 0,
                "chunk_index": 0, "n_chunks": 1}]
@@ -1891,14 +1957,15 @@ def t_calibration_drops_only_synthetic_budget_overflow_eos():
         # trailing EOS models the pinned generator's budget-overflow sentinel.
         return [prompts[0] + real_completion + [eos_token_id]]
 
-    result = E._run_calibration(
-        Model(), inputs, generate, 0, profiler, 32, len(real_completion), 7,
-        torch.device("cpu"),
+    must_raise(
+        RuntimeError,
+        lambda: E._run_calibration(
+            Model(), inputs, generate, 0, profiler, 32, len(real_completion), 7,
+            torch.device("cpu"),
+        ),
+        "exhausted",
     )
-    assert result["forwards"] == 1
-    assert result["response_tokens"] == len(real_completion)
-    assert result["generated_responses"][0]["token_ids_sha256"] == E._ids_sha256(real_completion)
-    assert seen == [prompt_ids + real_completion], "a real generated token was dropped"
+    assert seen == [], "a truncated trajectory reached the profiling forward"
     assert profiler.enabled is False
 
 
@@ -1924,6 +1991,16 @@ def t_calibration_rejects_no_usable_inputs_or_response():
         "no response",
     )
     assert profiler.enabled is False
+
+    short = {**item, "prompt_ids": list(range(8))}
+    must_raise(
+        RuntimeError,
+        lambda: E._run_calibration(
+            object(), [short], lambda *_args: [[50, 51]], 0, profiler, 64, 8, 1,
+            torch.device("cpu"), completion_validator=lambda _ids: False,
+        ),
+        "complete final answer",
+    )
 
 
 def t_calibration_provenance_binds_inputs_responses_and_parameters():
@@ -2239,6 +2316,8 @@ def t_primevul_corpus_feeds_the_ordinary_calibration_and_pair_loaders():
         # "calibration and evaluation are disjoint" claim untrue by construction
         assert len({path.rsplit("/", 1)[0] for path in paths}) == len(paths)
         assert paths == [p for p, _ in E.sample_calibration_files(root, 6, seed=965)]
+        must_raise(ValueError, lambda: E.sample_calibration_files(root, 1, seed=965),
+                   "at least 2")
         for path, content in selected:
             assert content == (root / path).read_text(encoding="utf-8")
 
@@ -2290,7 +2369,12 @@ def t_primevul_rows_cannot_borrow_the_codeql_alert_gate():
          "original_sha256": "a" * 64, "secure_sha256": "a" * 64}), "identical")
     assert E.pair_row_is_labelled(
         {"ground_truth": E.GROUND_TRUTH_PRIMEVUL, "commit_id": "abc",
-         "original_sha256": "a" * 64, "secure_sha256": "b" * 64}) is True
+         "original_sha256": "a" * 64, "secure_sha256": "b" * 64,
+         "function_identity": "f"}) is True
+    must_raise(ValueError, lambda: E.pair_row_is_labelled(
+        {"ground_truth": E.GROUND_TRUTH_PRIMEVUL, "commit_id": "abc",
+         "original_sha256": "a" * 64, "secure_sha256": "b" * 64}),
+        "function_identity")
 
 
 def t_corpus_identity_is_bound_to_the_manifest_and_refuses_ambiguity():
@@ -2375,12 +2459,15 @@ def t_primevul_pairing_is_verified_rather_than_assumed():
                  "line": i + 1}
                 for i, (commit, target, func) in enumerate(specs)]
 
-    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "x")), "f"), "even")
-    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "x"), ("b", 1, "y")), "f"),
+    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "int f(void) {x;}")), "f"), "even")
+    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "int f(void) {x;}"),
+                                                     ("b", 1, "int f(void) {y;}")), "f"),
                "unpaired split")
-    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "x"), ("a", 0, "x")), "f"),
+    must_raise(ValueError, lambda: P.pair_rows(rows(("a", 1, "int f(void) {x;}"),
+                                                     ("a", 0, "int f(void) {x;}")), "f"),
                "identical source")
-    must_raise(ValueError, lambda: P.pair_rows(rows(("", 1, "x"), ("", 0, "y")), "f"),
+    must_raise(ValueError, lambda: P.pair_rows(rows(("", 1, "int f(void) {x;}"),
+                                                     ("", 0, "int f(void) {y;}")), "f"),
                "no commit_id")
 
     # Members carrying different commit ids or file names are real pairs in the
@@ -2388,14 +2475,29 @@ def t_primevul_pairing_is_verified_rather_than_assumed():
     # they are counted and surfaced rather than treated as corruption -- which
     # would silently discard them.
     stats = {}
-    pairs = P.pair_rows(rows(("a", 1, "x"), ("b", 0, "y")), "f", stats=stats)
+    pairs = P.pair_rows(rows(("a", 1, "int f(void) {x;}"),
+                             ("b", 0, "int f(void) {y;}")), "f", stats=stats)
     assert len(pairs) == 1 and stats["commit_id_differs"] == 1
     assert pairs[0][0]["commit_id"] == "a", "the vulnerable member names the flaw"
     # The vulnerable member is identified by its label, not by its position.
-    for order in ((1, "bad"), (0, "safe")), ((0, "safe"), (1, "bad")):
+    for order in ((1, "int f(void) {bad;}"), (0, "int f(void) {safe;}")), \
+                 ((0, "int f(void) {safe;}"), (1, "int f(void) {bad;}")):
         (vulnerable, benign), = P.pair_rows(
             rows(("a", order[0][0], order[0][1]), ("a", order[1][0], order[1][1])), "f")
         assert vulnerable["target"] == 1 and benign["target"] == 0
+
+    # Adjacent opposite labels are not enough: both rows must declare the same
+    # function. This catches the real openssl_encrypt/openssl_decrypt anomaly.
+    stats = {}
+    assert P.pair_rows(rows(
+        ("a", 1, "PHP_FUNCTION(openssl_encrypt) { return; }"),
+        ("a", 0, "PHP_FUNCTION(openssl_decrypt) { return; }")),
+        "f", stats=stats) == []
+    assert stats["function_identity_differs"] == 1
+    assert P.function_identity("PHP_FUNCTION(openssl_encrypt) { }") == "openssl_encrypt"
+    assert P.function_identity("int C::method(int x) { return x; }") == "C::method"
+    assert P.function_identity(
+        "__releases(kernel_lock)\n__acquires(kernel_lock)\n{ return 0; }") is None
 
 
 def t_primevul_reader_refuses_ambiguous_or_mixed_schemas():
@@ -2448,8 +2550,10 @@ def t_primevul_conversion_dedupes_and_refuses_to_clobber():
         duplicated = primevul_rows(1) + primevul_rows(1)
         write_primevul(base / "src", duplicated)
         provenance = P.convert(base / "src", base / "primevul-c-files", ["test_paired"])
-        assert provenance["stats"] == {"pairs_read": 2, "skipped_duplicate": 1,
-                                       "skipped_oversized": 0, "written": 1}
+        assert provenance["stats"] == {
+            "pairs_read": 2, "skipped_function_identity": 0,
+            "skipped_duplicate": 1, "skipped_oversized": 0, "written": 1,
+        }
         assert provenance["ground_truth"] == E.GROUND_TRUTH_PRIMEVUL
         assert provenance["corpus_root_name"] == "primevul-c-files"
 
@@ -2510,7 +2614,7 @@ def t_split_aware_selection_keeps_the_evaluation_set_whole():
 
     Selection is otherwise split-blind, so on a root holding several splits an
     evaluation would be mostly whichever split is largest -- for the real
-    release, 3785 train pairs against 433 test ones.
+    verified release, 3746 train pairs against 427 test ones.
     """
     with tempfile.TemporaryDirectory() as td:
         root = converted_primevul_corpus(
@@ -2644,7 +2748,8 @@ def t_primevul_overwrite_replaces_rather_than_merges():
 def t_primevul_rows_must_hash_both_members():
     """load_pairs only verifies a member's bytes when the row carries its hash."""
     base = {"ground_truth": E.GROUND_TRUTH_PRIMEVUL, "commit_id": "abc",
-            "original_sha256": "a" * 64, "secure_sha256": "b" * 64}
+            "original_sha256": "a" * 64, "secure_sha256": "b" * 64,
+            "function_identity": "f"}
     assert E.pair_row_is_labelled(dict(base)) is True
     for dropped in ("original_sha256", "secure_sha256"):
         row = dict(base); del row[dropped]

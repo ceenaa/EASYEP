@@ -272,8 +272,8 @@ The main environment overrides are:
 | `N_CALIB` | `25` | calibration source files; token-exact chunking may produce more profiling trajectories |
 | `N_PAIRS` | `25` | matched vulnerable/secure pairs |
 | `MAX_SEQ_LEN` | `16384` | context window used by each stage. Not the config's `original_seq_len=65536`: prefill memory is quadratic and unblocked (~`16*T^2` bytes) against ~35 GiB of headroom, so 65536 OOMs and 24576 is the ceiling, enforced by both the launcher and `build()`. Token-exact chunking preserves whole sources, so a smaller window costs no coverage |
-| `MAX_NEW_TOKENS` | `2048` | question-evaluation response limit. Sized for reasoning mode, where the chain of thought precedes the answer; too small truncates before the answer is reached |
-| `PAIR_MAX_NEW_TOKENS` | `1024` | matched-pair response limit, same reasoning-mode sizing |
+| `MAX_NEW_TOKENS` | `8192` | calibration and question-evaluation response reservation for reasoning mode. Calibration aborts instead of profiling a response that exhausts this budget or has no extractable final answer |
+| `PAIR_MAX_NEW_TOKENS` | `8192` | matched-pair reasoning reservation. Exhaustion is recorded per row and failed answer extraction is always an abstention |
 | `MAX_CHUNKS` | `0` | calibration chunks per file; `0` means unlimited and a positive value is a fail-fast cap |
 | `LIMIT` | `0` | questions evaluated per variant; `0` is all of them. `N_CALIB` and `N_PAIRS` shrink the other stages, so this is the knob for a cheap end-to-end rehearsal |
 | `SEED` | `965` | calibration ordering, controls, and paired decoding seed |
@@ -281,6 +281,10 @@ The main environment overrides are:
 | `RUN_ID` | Slurm job id | suffix of the unique output directory |
 | `RESUME` | `0` | `1` reattaches only when the complete immutable provenance and every skipped stage checkpoint still match |
 | `STRICT_PINS` | `0` | `1` aborts when the active environment does not match `requirements-v4.txt` exactly; otherwise divergences are logged |
+| `FULL_CHECKPOINT_VERIFY` | `0` | `1` performs a fresh byte-for-byte checkpoint hash audit before the run; routine preflight still verifies the recorded content identity and shard metadata |
+| `EASYEP_CORPUS_DIR` | `DATA_ROOT/vulnerable-js-files` | calibration/pair corpus root; set to `DATA_ROOT/primevul-c-files` for PrimeVul |
+| `EASYEP_PAIRS_MANIFEST` | `CORPUS/CODEQL_SECURE_MANIFEST.jsonl` | exact matched-pair manifest |
+| `CALIB_SPLITS` / `PAIR_SPLITS` | empty | comma-separated corpus splits; use `train_paired` / `test_paired` for PrimeVul |
 | `MASTER_PORT_BASE` | job-derived | first of the per-stage rendezvous ports |
 | `PYTHON_MODULE` | `python` | module used to create and run the V4 virtual environment |
 | `CUDA_MODULE` | `cuda/13.2` | CUDA module loaded in the job |
@@ -288,12 +292,12 @@ The main environment overrides are:
 ### Fast development loop
 
 Use a small, complete batch rehearsal before a full experiment. It follows the
-same gates and artifact contracts while evaluating one calibration source, one
+same gates and artifact contracts while evaluating two balanced calibration sources, one
 matched pair, and one question per variant:
 
 ```bash
 env -u RUN_ID -u RESUME sbatch --account=YOUR_ALLOCATION --time=03:00:00 \
-  --export=ALL,RUN_ID=dev_001,RESUME=0,TEMPERATURE=0,N_CALIB=1,N_PAIRS=1,LIMIT=1 \
+  --export=ALL,RUN_ID=dev_001,RESUME=0,TEMPERATURE=0,N_CALIB=2,N_PAIRS=1,LIMIT=1 \
   v4/easyep.sbatch
 ```
 
@@ -329,7 +333,7 @@ export EASYEP_DATA_ROOT=/absolute/path/to/inputs
 export EASYEP_RESULTS_ROOT=/absolute/path/to/results
 export EASYEP_CONFIG="$PWD/v4/config_v4_flash.json"
 export RUN_ID=dev_002 RESUME=0
-export N_CALIB=1 N_PAIRS=1 LIMIT=1
+export N_CALIB=2 N_PAIRS=1 LIMIT=1
 export TEMPERATURE=0
 
 bash v4/run_in_allocation.sh
@@ -478,29 +482,28 @@ python v4/primevul_dataset.py convert  --primevul-dir "$PV" \
 python v4/primevul_dataset.py verify   --root "$EASYEP_DATA_ROOT/primevul-c-files"
 ```
 
-Then point the standalone modes at it; the Slurm launcher still hard-codes
-`vulnerable-js-files` and has not been wired for corpus selection yet:
+The normal Slurm launcher accepts the corpus and split explicitly and records
+their exact files and tree in immutable run provenance:
 
 ```bash
---calib-dir "$EASYEP_DATA_ROOT/primevul-c-files" \
---pairs-manifest "$EASYEP_DATA_ROOT/primevul-c-files/PRIMEVUL_PAIRED_MANIFEST.jsonl"
+export EASYEP_CORPUS_DIR="$EASYEP_DATA_ROOT/primevul-c-files"
+export EASYEP_PAIRS_MANIFEST="$EASYEP_CORPUS_DIR/PRIMEVUL_PAIRED_MANIFEST.jsonl"
+export CALIB_SPLITS=train_paired
+export PAIR_SPLITS=test_paired
 ```
 
 The converter refuses what it cannot verify rather than repairing it, and checks
 only what the release actually guarantees. Pairing is by adjacent rows, but each
 pair is *verified* - one vulnerable and one benign, both non-empty, source
-differing, vulnerable member naming a commit - because a single misaligned row
-would shift every later label by one and produce a corpus that looks fine.
-Measured over all three paired splits of v0.1 (870 + 7578 + 960 rows), those
-four properties hold universally.
+differing, vulnerable member naming a commit, and both declarations resolving
+to the same function identity. Unknown or different function identities are
+discarded and counted rather than trusted from adjacency alone.
 
-Two properties that look like invariants are **not**, and assuming them was a
-real bug caught against the shipped data: the two members carry different
+Other properties that look like invariants are **not**: the two members carry different
 `commit_id`s in 19 pairs and different `file_name`s in 13 more, because PrimeVul
 sometimes takes the benign revision from a later commit than the one that
-introduced the flaw. Rejecting those would silently discard real pairs, so they
-are counted into the conversion provenance and printed, not treated as
-corruption. `file_name` is also absent - serialised as the literal string
+introduced the flaw. Those metadata differences are counted but tolerated.
+`file_name` is also absent - serialised as the literal string
 `"None"` - for a fifth to a third of rows, which is why the display suffix comes
 from it when present and from a marker heuristic otherwise.
 
@@ -508,11 +511,11 @@ The converter also refuses a split whose rows mix schema variants, records which
 field carried the label instead of guessing silently, de-duplicates functions
 recurring across splits, and rolls back a partially written tree on any abort.
 
-Converting `test_paired` alone yields **433 pairs** (435 minus 2 exact
-duplicates) across 62 CWE strata, members `.c` 320 / `.cc` 69 / `.cpp` 36 /
-`.h` 8, median member 2382 characters and p99 49196. Converting all three splits
-yields **4694 pairs** (3785 train / 476 valid / 433 test, 10 cross-split
-duplicates dropped) across 120 strata in under two seconds. Nothing in
+Converting `test_paired` alone yields **427 verified pairs** (435 minus 6
+different-function rows and 2 duplicates) across 61 CWE strata. Converting all
+three splits yields **4639 verified pairs** (3746 train / 466 valid / 427 test;
+61 different-function rows, 2 unverifiable declaration pairs, and 2 duplicates
+dropped) across 119 strata. Nothing in
 `test_paired` exceeds the context budget, but the combined root has a 484 KB
 outlier, and `pairs` rejects over-context items rather than truncating and
 reports how many it dropped.
@@ -520,13 +523,10 @@ reports how many it dropped.
 The converted corpus is experiment data: gitignored like
 `deepseek_easy_ep_inputs/`.
 
-**It is not yet covered by the run manifest.** `run_provenance.py` hashes
-`vulnerable-js-files/` by name (`inputs.calibration_and_pair_tree`,
-`inputs.pair_manifest`), so a PrimeVul corpus contributes nothing to the run
-provenance and a PrimeVul run is not tamper-evident the way a CodeQL one is.
-`primevul_dataset.py verify` re-checks every member against the manifest and the
-score artifact carries the manifest digest, but neither is the run manifest.
-Closing this properly means parameterising the launcher, which has not been done.
+`run_provenance.py` hashes the selected corpus tree, pair manifest and questions
+by their configured paths. PrimeVul runs are therefore covered by the same
+tamper-evident run manifest as CodeQL runs, and the launcher additionally runs
+`primevul_dataset.py verify` before loading the model.
 
 ### Which split to use for what
 
@@ -547,7 +547,8 @@ untouched until the final run.
 ```bash
 ... pipeline --calib-dir "$C" --calib-splits train_paired --profile-only ...
 ... pairs    --calib-dir "$C" --pairs-splits test_paired \
-             --pairs-manifest "$C/PRIMEVUL_PAIRED_MANIFEST.jsonl" ...
+             --pairs-manifest "$C/PRIMEVUL_PAIRED_MANIFEST.jsonl" \
+             --parity-report "$OUT/parity/parity.json" ...
 ```
 
 `pairs` takes no `--calib-splits`: it reads the splits it was profiled on back
@@ -555,13 +556,13 @@ from the score artifact's `corpus_splits` and prints them.
 
 The practical reason is that calibration otherwise **spends the evaluation set**:
 every calibration file consumes a pair that matched-pair selection then excludes.
-Drawing calibration from `train_paired` leaves all 433 `test_paired` pairs
+Drawing calibration from `train_paired` leaves all 427 verified `test_paired` pairs
 available, and `skipped_calibration_overlap` drops to zero because the splits are
 disjoint by construction. The secondary reason is that `test_paired` is what
 PrimeVul's own paper reports on, so the numbers stay comparable.
 
 Selection is split-blind when no split is named, which on a multi-split root is
-rarely what you want: the real corpus holds 3785 train against 433 test pairs, so
+rarely what you want: the verified corpus holds 3746 train against 427 test pairs, so
 an unfiltered 200-pair evaluation would be about 90% training data. Naming a
 split a corpus cannot express - the CodeQL tree, or a directory with no manifest
 - is refused rather than silently matching nothing, and the splits actually
@@ -726,7 +727,7 @@ evaluating under an optimised runtime, the way the R1 pipeline uses sglang.
 ## Tests
 
 ```bash
-"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 85 tests, seconds, no GPU
+"$EASYEP_VENV/bin/python" v4/test_easyep_v4.py  # 92 tests, seconds, no GPU
 ```
 
 Covers the parts a reviewer would otherwise have to check by reading: mask

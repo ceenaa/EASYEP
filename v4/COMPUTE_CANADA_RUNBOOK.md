@@ -69,8 +69,19 @@ python v4/primevul_dataset.py convert  --primevul-dir "$PV" --out "$C" \
 python v4/primevul_dataset.py verify   --root "$C"
 ```
 
-That is 4694 pairs (3785 train / 476 valid / 433 test) in one root, which takes
-about two seconds. Keep all three in **one** root: the corpus identity is the
+For the normal gated launcher, select that corpus explicitly:
+
+```bash
+export EASYEP_CORPUS_DIR="$C"
+export EASYEP_PAIRS_MANIFEST="$C/PRIMEVUL_PAIRED_MANIFEST.jsonl"
+export CALIB_SPLITS=train_paired
+export PAIR_SPLITS=test_paired
+```
+
+That is 4639 verified pairs (3746 train / 466 valid / 427 test) in one root. The
+converter rejects 63 adjacent rows whose function identity differs or cannot be
+verified and 2 duplicates. Conversion takes about two seconds. Keep all three in **one**
+root: the corpus identity is the
 manifest digest, so two roots would make calibration and evaluation refuse each
 other. Choose per stage instead:
 
@@ -80,12 +91,13 @@ other. Choose per stage instead:
     --calib-dir "$C" --calib-splits train_paired --profile-only ...
 "$EASYEP_VENV/bin/torchrun" --nproc-per-node=4 v4/easyep_v4.py pairs \
     --calib-dir "$C" --pairs-splits test_paired \
+    --parity-report "$OUT/parity/parity.json" \
     --pairs-manifest "$C/PRIMEVUL_PAIRED_MANIFEST.jsonl" ...
 ```
 
 Omitting the flags draws from every split, which on this root means an
 evaluation about 90% training data - so name them. Calibrating from a split you
-do not evaluate on also keeps the whole 433-pair test set available;
+do not evaluate on also keeps the whole 427-pair test set available;
 `skipped_calibration_overlap` should read 0.
 
 Do not rename the output directory afterwards: the manifest addresses members
@@ -105,8 +117,8 @@ The main launcher defaults are:
 export TEMPERATURE=0          # greedy and deterministic
 export KEEP=128               # retain 128/256 experts in layers 3-42
 export MAX_SEQ_LEN=16384
-export MAX_NEW_TOKENS=2048
-export PAIR_MAX_NEW_TOKENS=1024
+export MAX_NEW_TOKENS=8192
+export PAIR_MAX_NEW_TOKENS=8192
 export MAX_CHUNKS=0            # preserve every calibration chunk
 export SEED=965
 ```
@@ -116,9 +128,10 @@ temperature 1 does not eliminate sampling variance after pruning changes the
 token distribution. Run positive-temperature experiments separately over
 multiple seeds and report their mean and variance.
 
-Do not reduce response limits to 256/128 for quality evaluation: reasoning can
-consume the entire budget before the structured answer. The September smoke run
-used those small limits only to debug the pipeline.
+Do not reduce these response limits for quality evaluation: reasoning can consume
+the entire budget before the structured answer. Calibration aborts if it reaches
+the cap or cannot extract a final answer; evaluation records cap exhaustion and
+scores failed extraction as an abstention, never by reading the reasoning trace.
 
 ## Choose the right submission mode
 
@@ -129,7 +142,7 @@ charges all four H100s while idle.
 
 ### Small batch rehearsal
 
-Run one calibration source, one question, and one vulnerable/safe pair before a
+Run two balanced calibration sources, one question, and one vulnerable/safe pair before a
 large experiment:
 
 ```bash
@@ -137,7 +150,7 @@ cd "$EASYEP_REPO"
 env -u RUN_ID -u RESUME sbatch \
   --account=rrg-tayebi_gpu \
   --time=03:00:00 \
-  --export=ALL,RUN_ID=dev_YYYYMMDD_01,RESUME=0,TEMPERATURE=0,N_CALIB=1,N_PAIRS=1,LIMIT=1 \
+  --export=ALL,RUN_ID=dev_YYYYMMDD_01,RESUME=0,TEMPERATURE=0,N_CALIB=2,N_PAIRS=1,LIMIT=1 \
   v4/easyep.sbatch
 ```
 
@@ -165,7 +178,7 @@ export EASYEP_DATA_ROOT=/scratch/sinam/deepseek_easy_ep/inputs
 export EASYEP_RESULTS_ROOT=/scratch/sinam/deepseek_easy_ep/results
 export EASYEP_CONFIG=/home/sinam/EASYEP-v4/v4/config_v4_flash.json
 export RUN_ID=dev_YYYYMMDD_01 RESUME=0 TEMPERATURE=0
-export N_CALIB=1 N_PAIRS=1 LIMIT=1
+export N_CALIB=2 N_PAIRS=1 LIMIT=1
 
 cd "$EASYEP_REPO"
 bash v4/run_in_allocation.sh

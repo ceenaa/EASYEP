@@ -66,6 +66,7 @@ ACCUMULATION_MODE = "torch-deterministic-index-add-v1"
 MODEL_IDENTITY_SCHEMA_VERSION = 1
 MAX_ERROR_SAMPLES_PER_LAYER_PER_RANK = 10_000
 MHC_SCORE_CHUNK_TOKENS = 1024
+DEFAULT_REASONING_MAX_NEW_TOKENS = 8192
 # Indexer.forward scores the whole prefill unblocked and materialises
 # [1,T,n_local_heads,T/4] bf16 twice, so the transient is ~16*T^2 bytes against
 # ~35 GiB of headroom on 4xH100 (weights are 43.5 GiB/rank). 16384 costs 4.9 GiB
@@ -964,6 +965,24 @@ def _validate_model_identity_record(identity: Any, source: str) -> str:
     return _identity_digest(identity)
 
 
+def require_passing_parity_report(path: Path | str,
+                                  model_identity: dict) -> dict:
+    """Require a passing parity result for this exact model/runtime identity."""
+    path = Path(path)
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read a valid parity report from {path}: {exc}") from exc
+    if not isinstance(report, dict) or report.get("pass") is not True:
+        raise SystemExit(f"{path} does not record a passing parity check")
+    expected = _validate_model_identity_record(model_identity, "current model")
+    if report.get("model_identity_sha256") != expected:
+        raise SystemExit(
+            f"{path} was produced by a different model/checkpoint; "
+            "rerun parity before evaluation")
+    return report
+
+
 def _identity_difference(artifact: Any, expected: Any, path: str = "model_identity") -> str:
     """Return a compact path to the first provenance mismatch."""
     if type(artifact) is not type(expected):
@@ -1510,6 +1529,11 @@ def pair_row_is_labelled(row: dict) -> bool:
         raise ValueError(
             f"primevul pair for commit {commit} has identical members; "
             "the benign member must be the post-fix revision, not a copy")
+    identity = row.get("function_identity")
+    if not isinstance(identity, str) or not identity.strip():
+        raise ValueError(
+            f"primevul pair for commit {commit} has no verified function_identity; "
+            "re-convert the corpus with the current v4/primevul_dataset.py")
     return True
 
 
@@ -1702,6 +1726,10 @@ def _balanced_manifest_sample(root: Path, n: int, seed: int,
             f"no calibration candidates in {root} for split(s) {', '.join(splits)}")
     if not candidates:
         return []
+    if n < 2:
+        raise ValueError(
+            "manifest-backed calibration needs at least 2 files so both labels "
+            "are represented; --n-calib counts files, not matched pairs")
     rng = random.Random(seed)
     targets = {"vulnerable": (n + 1) // 2, "secure": n // 2}
     if rng.randrange(2):
@@ -1878,10 +1906,10 @@ def _decode_completion(tok, generated, prompt_ids: list[int]) -> tuple[str, int]
     """Decode only the generated continuation, never the prompt.
 
     Every generate() consumer must agree on the API's contract. The pinned
-    generator returns prompt+completion, so decoding element 0 whole would store
-    the prompt -- including the answer scaffolding -- as the model's answer.
-    _completion_token_ids strips it when present and is a no-op otherwise, so
-    this stays correct under either convention.
+    generator returns completion tokens, while other APIs may return
+    prompt+completion. _completion_token_ids strips a repeated prompt when
+    present and is a no-op otherwise, so this stays correct under either
+    convention and never stores answer scaffolding as model output.
     """
     ids = _completion_token_ids(generated, prompt_ids)
     return tok.decode(ids), len(ids)
@@ -1889,7 +1917,7 @@ def _decode_completion(tok, generated, prompt_ids: list[int]) -> tuple[str, int]
 
 def _run_calibration(model, inputs: list[dict], generate, eos_token_id: int,
                      profiler: Profiler, max_seq_len: int, max_new_tokens: int,
-                     seed: int, device, say=None) -> dict:
+                     seed: int, device, say=None, completion_validator=None) -> dict:
     """Generate with profiling off, then profile the exact prompt+response tokens.
 
     The original EASY-EP calibration examples are complete model trajectories,
@@ -1920,6 +1948,19 @@ def _run_calibration(model, inputs: list[dict], generate, eos_token_id: int,
             completion_ids = completion_ids[:-1]
         if len(completion_ids) > max_new_tokens:
             raise RuntimeError("calibration generator exceeded max_new_tokens")
+        if len(completion_ids) == max_new_tokens:
+            raise RuntimeError(
+                f"calibration generation exhausted its {max_new_tokens}-token response "
+                f"budget for {item.get('path', run_index)}; the routing trajectory "
+                "may end mid-reasoning. Increase --max-new-tokens and re-profile")
+        answer_extracted = None
+        if completion_validator is not None:
+            answer_extracted = bool(completion_validator(completion_ids))
+            if not answer_extracted:
+                raise RuntimeError(
+                    f"calibration generation for {item.get('path', run_index)} "
+                    "ended without a complete final answer; refusing to profile an "
+                    "unfinished reasoning trajectory")
         if len(prompt_ids) + len(completion_ids) > max_seq_len:
             raise RuntimeError(
                 "calibration generator exceeded the reserved response budget; "
@@ -1940,6 +1981,8 @@ def _run_calibration(model, inputs: list[dict], generate, eos_token_id: int,
             "chunk_index": int(item.get("chunk_index", 0)),
             "tokens": len(completion_ids),
             "token_ids_sha256": _ids_sha256(completion_ids),
+            **({"answer_extracted": answer_extracted}
+               if answer_extracted is not None else {}),
         })
         if say is not None:
             chunk = (f" chunk {item['chunk_index'] + 1}/{item['n_chunks']}"
@@ -2064,6 +2107,21 @@ def _require_evaluation_calibration(state: dict, source: str, *,
             f"{THINKING_MODE!r}. The mode changes what the model emits and which "
             "experts route, so the masks would come from a different "
             "distribution than the evaluation. Re-profile.")
+    parameters = calibration.get("parameters", {})
+    response_limit = parameters.get("max_new_tokens")
+    responses = calibration.get("generated_responses", [])
+    if (isinstance(response_limit, int)
+            and any(isinstance(item, dict)
+                    and isinstance(item.get("tokens"), int)
+                    and item["tokens"] >= response_limit for item in responses)):
+        raise SystemExit(
+            f"{source} was profiled from a response that exhausted its generation "
+            "budget, so its routing trajectory may end mid-reasoning. Re-profile "
+            "with a larger --max-new-tokens value.")
+    if any(isinstance(item, dict) and item.get("answer_extracted") is False
+           for item in responses):
+        raise SystemExit(
+            f"{source} records an incomplete calibration answer; re-profile it")
     if need_corpus_paths and calibration.get("source_kind") != "corpus_files":
         raise SystemExit(
             f"{source} was profiled from {calibration.get('source_kind')!r}, whose "
@@ -2564,6 +2622,10 @@ def load_pairs(manifest: Path, root: Path, n: int, seed: int = 42,
         candidate = {"pair_id": len(out), "queries": r.get("queries", []),
                      "ground_truth": pair_row_ground_truth(r),
                      "split": r.get("primevul_split"),
+                     "commit_id": r.get("commit_id"),
+                     "project": r.get("project"),
+                     "function_identity": r.get("function_identity"),
+                     "cve": r.get("cve"),
                      "alert_locations": int(r.get("alert_locations", 0) or 0),
                      "vuln_path": r["original_file"], "vuln_code": vc,
                      "safe_path": r["secure_file"], "safe_code": sc,
@@ -2607,11 +2669,10 @@ def final_message(parse_message, completion: str) -> tuple[str, bool]:
     turn ordinary reasoning into systematic unparsed rows. Grade the answer, not
     the thinking; the full completion is still stored and still judged.
 
-    Returns (text, extracted). The fallback is deliberately total -- a parser
-    that raises or returns nothing usable must not lose a row -- but a silent
-    total fallback would put us straight back to reading verdicts out of the
-    reasoning trace with no sign anything was wrong. The caller records the flag
-    so the summary can say how often extraction actually worked.
+    Returns (text, extracted). The raw completion remains available to preserve
+    the failed row for diagnosis, but callers must treat ``extracted=False`` as
+    an abstention. In particular, they must never search this fallback for a
+    verdict: it is the unfinished reasoning trace, not the model's final answer.
     """
     try:
         message = parse_message(completion, thinking_mode=THINKING_MODE)
@@ -2625,6 +2686,11 @@ def final_message(parse_message, completion: str) -> tuple[str, bool]:
             if isinstance(value, str) and value.strip():
                 return value, True
     return completion, False
+
+
+def extracted_verdict(answer: str, answer_extracted: bool) -> str | None:
+    """Parse only a successfully extracted final answer, never a raw trace."""
+    return parse_verdict(answer) if answer_extracted else None
 
 
 def parse_verdict(text: str) -> str | None:
@@ -2679,6 +2745,8 @@ def discrimination_stats(rows: list[dict]) -> dict:
     pj = None if ptpr is None or ptnr is None else ptpr + ptnr - 1
     pbalacc = None if ptpr is None or ptnr is None else (ptpr + ptnr) / 2
     unparsed = sum(1 for r in rows if r["verdict"] is None)
+    generation_limit_reached = sum(
+        1 for r in rows if r.get("generation_limit_reached") is True)
     return {
         "n_vulnerable": len(v), "n_safe": len(s),
         "verdict_coverage": rounded(ratio(len(rows) - unparsed, len(rows))),
@@ -2701,6 +2769,12 @@ def discrimination_stats(rows: list[dict]) -> dict:
             "youden_j": 0.0, "balanced_accuracy": 0.5,
         },
         "unparsed_verdicts": unparsed,
+        "generation_limit_reached": generation_limit_reached,
+        "generation_limit_rate": rounded(ratio(generation_limit_reached, len(rows))),
+        "quality_metrics_valid": generation_limit_reached == 0,
+        "quality_metrics_invalid_reason": (
+            None if generation_limit_reached == 0 else
+            "one or more completions exhausted the generation budget"),
         # In reasoning mode the completion is mostly chain of thought, so a
         # single "mean_words" would silently stop measuring the answer. Report
         # both: the answer is what the verdict came from, the completion is what
@@ -2710,10 +2784,76 @@ def discrimination_stats(rows: list[dict]) -> dict:
         "answer_extraction_rate": round(
             sum(1 for r in rows if r.get("answer_extracted")) / max(len(rows), 1), 3),
         "mean_answer_words": round(
-            sum(len(str(r.get("answer") or r["completion"]).split()) for r in rows)
+            sum(len(str(r.get("answer") or "").split()) for r in rows)
             / max(len(rows), 1), 1),
         "mean_completion_words": round(
             sum(len(r["completion"].split()) for r in rows) / max(len(rows), 1), 1),
+    }
+
+
+def paired_discrimination_stats(rows: list[dict]) -> dict:
+    """Classify complete matched-pair outcomes, with abstentions fail-closed.
+
+    P-C means both members were classified correctly; P-V means both were called
+    vulnerable; P-B means both were called benign; P-R means the labels were
+    reversed; P-U contains any pair with an unparsed member. The categories are
+    exhaustive and use the total pair count as their denominator, so truncation
+    cannot disappear from the headline pair accuracy.
+    """
+    grouped: dict[int, dict[str, str | None]] = {}
+    for row in rows:
+        if "pair_id" not in row:
+            raise ValueError("matched-pair row has no pair_id")
+        truth = row.get("truth")
+        if truth not in ("VULNERABLE", "SAFE"):
+            raise ValueError(f"matched-pair row has invalid truth {truth!r}")
+        if row.get("verdict") not in ("VULNERABLE", "SAFE", None):
+            raise ValueError(
+                f"matched-pair row has invalid verdict {row.get('verdict')!r}")
+        pair = grouped.setdefault(row["pair_id"], {})
+        if truth in pair:
+            raise ValueError(
+                f"matched pair {row['pair_id']} repeats its {truth} member")
+        pair[truth] = row.get("verdict")
+
+    categories = {name: 0 for name in ("P-C", "P-V", "P-B", "P-R", "P-U")}
+    for pair_id, verdicts in grouped.items():
+        if set(verdicts) != {"VULNERABLE", "SAFE"}:
+            raise ValueError(f"matched pair {pair_id} does not contain both labels")
+        vulnerable, safe = verdicts["VULNERABLE"], verdicts["SAFE"]
+        if vulnerable is None or safe is None:
+            category = "P-U"
+        elif vulnerable == "VULNERABLE" and safe == "SAFE":
+            category = "P-C"
+        elif vulnerable == safe == "VULNERABLE":
+            category = "P-V"
+        elif vulnerable == safe == "SAFE":
+            category = "P-B"
+        else:
+            category = "P-R"
+        categories[category] += 1
+
+    total = len(grouped)
+    complete = total - categories["P-U"]
+    ratio = lambda numerator, denominator: numerator / denominator if denominator else None
+    rounded = lambda value: round(value, 4) if value is not None else None
+    return {
+        "n_pairs": total,
+        "complete_pairs": complete,
+        "pair_coverage": rounded(ratio(complete, total)),
+        "pair_accuracy": rounded(ratio(categories["P-C"], total)),
+        "parsed_only_pair_accuracy": rounded(ratio(categories["P-C"], complete)),
+        "categories": {
+            name: {"count": count, "rate": rounded(ratio(count, total))}
+            for name, count in categories.items()
+        },
+        "category_definitions": {
+            "P-C": "both members correct",
+            "P-V": "both members predicted VULNERABLE",
+            "P-B": "both members predicted SAFE",
+            "P-R": "both members reversed",
+            "P-U": "one or both verdicts unparsed",
+        },
     }
 
 
@@ -2722,6 +2862,7 @@ def cmd_pairs(a) -> None:
     official, model, tok, args, rank, world_size = build(
         a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1, a.temperature)
     model_identity = _model_identity(a.ckpt_path, a.config, a.code_dir, world_size)
+    require_passing_parity_report(a.parity_report, model_identity)
     sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
     from encoding_dsv4 import encode_messages, parse_message_from_completion_text
     sys.path.insert(0, a.code_dir)
@@ -2850,7 +2991,8 @@ def cmd_pairs(a) -> None:
             "pairs": [{**{key: pair.get(key) for key in
                            ("pair_id", "vuln_path", "safe_path", "original_sha256",
                             "secure_sha256", "queries", "alert_locations",
-                            "ground_truth", "split")},
+                            "ground_truth", "split", "commit_id", "project",
+                            "function_identity", "cve")},
                        "prompts": prompt_provenance[pair["pair_id"]]}
                       for pair in pairs],
         }
@@ -2873,6 +3015,7 @@ def cmd_pairs(a) -> None:
             with torch.inference_mode(), timer.measure(model, tag, pid) as timing:
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion, n_completion = _decode_completion(tok, gen, ids)
+            generation_limit_reached = n_completion >= a.max_new_tokens
             answer, answer_extracted = final_message(
                 parse_message_from_completion_text, completion)
             if rank == 0:
@@ -2883,9 +3026,10 @@ def cmd_pairs(a) -> None:
                              "prompt": item["prompt"],
                              "prompt_sha256": item["prompt_sha256"],
                              "prompt_ids_sha256": _ids_sha256(ids),
-                             "verdict": parse_verdict(answer),
-                             "answer": answer,
+                             "verdict": extracted_verdict(answer, answer_extracted),
+                             "answer": answer if answer_extracted else None,
                              "answer_extracted": answer_extracted,
+                             "generation_limit_reached": generation_limit_reached,
                              "completion": completion,
                              "seed": a.seed + pid,
                              "temperature": args.temperature,
@@ -2901,6 +3045,7 @@ def cmd_pairs(a) -> None:
                 for r in rows:
                     fp.write(json.dumps(r) + "\n")
             summary[tag] = discrimination_stats(rows)
+            summary[tag]["matched_pairs"] = paired_discrimination_stats(rows)
             summary[tag]["throughput"] = timer.stats()
 
     if rank == 0:
@@ -2943,6 +3088,12 @@ def cmd_pairs(a) -> None:
             say(f"{tag:<20}{d['tpr_recall']:>8.3f}{d['safe_error_rate']:>8.3f}"
                 f"{d['youden_j']:>8.3f}{d['balanced_accuracy']:>9.3f}"
                 f"{d['mean_answer_words']:>8.1f}{d['verdict_coverage']:>7.2f}")
+            paired = d["matched_pairs"]
+            counts = paired["categories"]
+            say(f"{'':<20}pairs acc={paired['pair_accuracy']:.3f} "
+                f"coverage={paired['pair_coverage']:.3f}  "
+                + " ".join(f"{name}={counts[name]['count']}"
+                           for name in ("P-C", "P-V", "P-B", "P-R", "P-U")))
         say("always-VULNERABLE baseline: TPR 1.000  safeerr 1.000  J 0.000  balacc 0.500")
         say("=" * 72)
     if world_size > 1:
@@ -3204,6 +3355,7 @@ def cmd_parity(a) -> None:
         raise ValueError("parity tolerances must be finite and non-negative")
     official, model, tok, args, rank, world_size = build(
         a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1)
+    model_identity = _model_identity(a.ckpt_path, a.config, a.code_dir, world_size)
     sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
     from encoding_dsv4 import encode_messages
 
@@ -3266,7 +3418,9 @@ def cmd_parity(a) -> None:
     report = {"noise_floor": floor, "patched_profiling_off": c_off,
               "patched_profiling_on": c_on, "bisect": stage_reports,
               "after_unpatch": c_res,
-              "tolerance_used": tol, "abs_tol": a.tol, "floor_multiplier": a.floor_mult}
+              "tolerance_used": tol, "abs_tol": a.tol, "floor_multiplier": a.floor_mult,
+              "model_identity_sha256": _validate_model_identity_record(
+                  model_identity, "current model")}
     ok = True
     gated = [("profiling OFF", c_off)]
     gated.extend((f"profiling {name}", result)
@@ -3357,7 +3511,7 @@ def cmd_validate(a) -> None:
         a.ckpt_path, a.config, a.code_dir, a.max_seq_len, 1,
         getattr(a, "temperature", None))
     sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
-    from encoding_dsv4 import encode_messages
+    from encoding_dsv4 import encode_messages, parse_message_from_completion_text
     sys.path.insert(0, a.code_dir)
     from generate import generate
 
@@ -3387,7 +3541,9 @@ def cmd_validate(a) -> None:
     try:
         cal = _run_calibration(
             model, inputs, generate, tok.eos_token_id, prof, a.max_seq_len,
-            a.max_new_tokens, a.seed, dev, say)
+            a.max_new_tokens, a.seed, dev, say,
+            completion_validator=lambda ids: final_message(
+                parse_message_from_completion_text, tok.decode(ids))[1])
     finally:
         prof.enabled = prof.validate = False
     _validate_profile_observations(prof, args.n_hash_layers, require_true=True)
@@ -3491,7 +3647,7 @@ def cmd_pipeline(a) -> None:
     )
     model_identity = _model_identity(a.ckpt_path, a.config, a.code_dir, world_size)
     sys.path.insert(0, str(Path(a.code_dir).parent / "encoding"))
-    from encoding_dsv4 import encode_messages
+    from encoding_dsv4 import encode_messages, parse_message_from_completion_text
     sys.path.insert(0, a.code_dir)
     from generate import generate
 
@@ -3555,7 +3711,9 @@ def cmd_pipeline(a) -> None:
     t0 = time.time()
     cal = _run_calibration(
         model, inputs, generate, tok.eos_token_id, prof, a.max_seq_len,
-        a.max_new_tokens, a.seed, dev, say)
+        a.max_new_tokens, a.seed, dev, say,
+        completion_validator=lambda ids: final_message(
+            parse_message_from_completion_text, tok.decode(ids))[1])
     _validate_profile_observations(prof, args.n_hash_layers)
     say(f"  {cal['forwards']} full prompt+response passes over {len(files)} files; "
         f"{cal['response_tokens']} generated response tokens")
@@ -3677,6 +3835,7 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
             with torch.inference_mode(), timer.measure(model, tag, i) as timing:
                 gen = generate(model, [ids], a.max_new_tokens, tok.eos_token_id)
             completion, n_completion = _decode_completion(tok, gen, ids)
+            generation_limit_reached = n_completion >= a.max_new_tokens
             answer, answer_extracted = final_message(
                 parse_message_from_completion_text, completion)
             if rank == 0:
@@ -3694,8 +3853,9 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                     # the answer with the chain of thought stripped, so an
                     # external judge can grade the answer without wading
                     # through (or being swayed by) the deliberation
-                    "answer": answer,
+                    "answer": answer if answer_extracted else None,
                     "answer_extracted": answer_extracted,
+                    "generation_limit_reached": generation_limit_reached,
                     "seed": a.seed + i,
                     "temperature": args.temperature,
                     "prompt_tokens": len(ids),
@@ -3723,6 +3883,13 @@ def _evaluate(a, model, tok, args, rank, world_size, dev, out, say,
                     sum(r["completion_tokens"] for r in rows) / max(len(rows), 1), 1),
                 "max_completion_tokens": max(
                     (r["completion_tokens"] for r in rows), default=0),
+                "answer_extraction_rate": round(
+                    sum(1 for r in rows if r["answer_extracted"])
+                    / max(len(rows), 1), 4),
+                "generation_limit_reached": sum(
+                    1 for r in rows if r["generation_limit_reached"]),
+                "quality_metrics_valid": not any(
+                    r["generation_limit_reached"] for r in rows),
                 "throughput": timer.stats(),
             }
 
@@ -3775,9 +3942,9 @@ def main() -> None:
     common(sp)
     sp.add_argument("--calib", required=True)
     sp.add_argument("--out", required=True)
-    sp.add_argument("--max-new-tokens", type=int, default=2048,
+    sp.add_argument("--max-new-tokens", type=int, default=DEFAULT_REASONING_MAX_NEW_TOKENS,
                     help="response tokens generated before profiling prompt+response; "
-                         "default 2048 leaves room for reasoning plus the final answer")
+                         "default 8192 leaves room for reasoning plus the final answer")
     sp.add_argument("--max-chunks", type=int, default=0,
                     help="maximum token-exact chunks per sample; 0 is unlimited")
     sp.add_argument("--seed", type=int, default=965)
@@ -3804,8 +3971,8 @@ def main() -> None:
     sp.add_argument("--out", required=True,
                     help="output DIRECTORY; writes answers_<tag>.jsonl and "
                          "summary.json, the same layout the pipeline emits")
-    sp.add_argument("--max-new-tokens", type=int, default=2048,
-                    help="response-token limit; default 2048 avoids truncating reasoning-mode answers")
+    sp.add_argument("--max-new-tokens", type=int, default=DEFAULT_REASONING_MAX_NEW_TOKENS,
+                    help="response-token limit; default 8192 is reserved for reasoning-mode answers")
     sp.add_argument("--seed", type=int, default=965,
                     help="item i is decoded with manual_seed(seed+i)")
     sp.add_argument("--temperature", type=float, default=0.0,
@@ -3823,8 +3990,8 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=192)
-    sp.add_argument("--max-new-tokens", type=int, default=2048,
-                    help="response-token limit; default 2048 avoids truncating reasoning-mode answers")
+    sp.add_argument("--max-new-tokens", type=int, default=DEFAULT_REASONING_MAX_NEW_TOKENS,
+                    help="response-token limit; default 8192 is reserved for reasoning-mode answers")
     sp.add_argument("--scores-in", default="",
                     help="reuse expert_scores.pt from an earlier run; skips profiling "
                          "and rebuilds every mask from those statistics")
@@ -3846,6 +4013,8 @@ def main() -> None:
     sp = sub.add_parser("pairs", help="matched vulnerable/secure discrimination eval")
     common(sp)
     sp.add_argument("--scores-in", required=True)
+    sp.add_argument("--parity-report", required=True,
+                    help="passing parity.json from this exact model/checkpoint")
     sp.add_argument("--pairs-manifest", required=True)
     sp.add_argument("--calib-dir", required=True,
                     help="corpus root the pairs and the calibration both live under")
@@ -3857,8 +4026,8 @@ def main() -> None:
     sp.add_argument("--n-pairs", type=int, default=25)
     sp.add_argument("--keep", type=int, default=128)
     sp.add_argument("--keep-sweep", default="", help='comma-separated extra keep counts for a pruning-rate sweep, e.g. "115,102,90,77,64" for 55/60/65/70/75%% pruning of 256 experts. Masks are rebuilt from the same score artifact, so a sweep costs generation time only and never a re-profile.')
-    sp.add_argument("--max-new-tokens", type=int, default=1024,
-                    help="response-token limit; default 1024 leaves room for the short verdict format")
+    sp.add_argument("--max-new-tokens", type=int, default=DEFAULT_REASONING_MAX_NEW_TOKENS,
+                    help="response-token limit; default 8192 leaves room for reasoning before the verdict")
     sp.add_argument("--seed", type=int, default=965)
     sp.add_argument("--temperature", type=float, default=0.0,
                     help="decoding temperature; default 0 uses greedy decoding")
@@ -3892,8 +4061,8 @@ def main() -> None:
     sp.add_argument("--out", required=True)
     sp.add_argument("--n-calib", type=int, default=25)
     sp.add_argument("--keep", type=int, default=128)
-    sp.add_argument("--max-new-tokens", type=int, default=2048,
-                    help="calibration response-token limit; default 2048 avoids truncation")
+    sp.add_argument("--max-new-tokens", type=int, default=DEFAULT_REASONING_MAX_NEW_TOKENS,
+                    help="calibration response-token limit; default 8192; exhausting it aborts profiling")
     sp.add_argument("--max-chunks", type=int, default=0,
                     help="maximum token-exact chunks per file; 0 is unlimited")
     sp.add_argument("--seed", type=int, default=965)

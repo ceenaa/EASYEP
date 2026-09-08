@@ -21,8 +21,11 @@ The existing `vulnerable-js-files` corpus pairs a file CodeQL flagged with the
 same file after the flagged expression was neutralised and the copy rescanned
 clean. Ground truth is "a static analyser's alert, and its absence".
 
-A PrimeVul pair is the pre- and post-fix revision of one function from a real
-vulnerability-fixing commit. Ground truth is "maintainers shipped a fix here".
+A usable PrimeVul pair is the pre- and post-fix revision of one function from a
+real vulnerability-fixing commit. The release contains a small number of
+adjacent opposite-label rows naming different functions, plus clipped rows with
+no recoverable declaration. This converter rejects both cases. Ground truth for
+retained pairs is "maintainers shipped a fix to this same function here".
 That is a stronger claim about the vulnerable member and a *weaker* one about
 the benign member: the post-fix function is only known not to contain the
 vulnerability that commit fixed. It is not certified free of every other one,
@@ -45,8 +48,8 @@ via `--calib-splits` / `--pairs-splits`. Convert all three paired splits into
 calibration and matched-pair evaluation refuse each other.
 
 Recommended is `--calib-splits train_paired` with `--pairs-splits test_paired`,
-which keeps the whole 433-pair test set available instead of spending part of it
-on profiling. Naming no split draws from every split, which on a multi-split
+which keeps the whole 427-pair verified test set available instead of spending
+part of it on profiling. Naming no split draws from every split, which on a multi-split
 root is rarely intended.
 
 Split separation is hygiene rather than necessity: EASY-EP calibration is
@@ -76,7 +79,7 @@ import shutil
 import sys
 from pathlib import Path
 
-CONVERTER_VERSION = "primevul-corpus-v1"
+CONVERTER_VERSION = "primevul-corpus-v2"
 MANIFEST_NAME = "PRIMEVUL_PAIRED_MANIFEST.jsonl"
 PROVENANCE_NAME = "DATASET_PROVENANCE.json"
 GROUND_TRUTH = "primevul_commit_pair"
@@ -127,6 +130,24 @@ SOURCE_SUFFIXES = frozenset({".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"})
 
 _CWE_RE = re.compile(r"CWE-\d+", re.IGNORECASE)
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_FUNCTION_LIKE_RE = re.compile(
+    r"(?<![\w])((?:[A-Za-z_]\w*::)*~?[A-Za-z_]\w*)\s*\(")
+_FUNCTION_KEYWORDS = frozenset({
+    "if", "for", "while", "switch", "return", "sizeof", "alignof",
+    "decltype", "noexcept", "asm", "static_assert", "__attribute__",
+    "__declspec",
+    # Linux sparse lock-context annotations can be the first visible tokens in
+    # a clipped PrimeVul sample whose actual declaration is absent. They are
+    # not function identities; treating them as such would manufacture a
+    # mismatch instead of honestly marking the pair unverifiable.
+    "__acquires", "__releases", "__must_hold",
+})
+_FUNCTION_MACROS = (
+    re.compile(r"\b(?:PHP|ZEND)_FUNCTION\s*\(\s*([A-Za-z_]\w*)\s*\)"),
+    re.compile(
+        r"\b(?:PHP|ZEND)_METHOD\s*\(\s*([A-Za-z_]\w*)\s*,\s*"
+        r"([A-Za-z_]\w*)\s*\)"),
+)
 
 
 # ------------------------------------------------------------------ reading
@@ -263,6 +284,38 @@ def guess_extension(func: str, file_name: str = "") -> str:
 
 # ------------------------------------------------------------------ pairing
 
+def function_identity(func: str) -> str | None:
+    """Conservatively recover the function named by a C/C++ sample.
+
+    PrimeVul does not ship an explicit pair identifier or function-name field.
+    Its paired files are adjacent rows, but a small number of those rows name
+    unrelated functions. Only the declaration prefix (before the first body
+    brace) is inspected. Unknown declarations are rejected by ``pair_rows``
+    rather than being guessed into the evaluation set.
+    """
+    prefix = func.split("{", 1)[0]
+    prefix = re.sub(r"/\*.*?\*/|//[^\n]*", " ", prefix, flags=re.DOTALL)
+    function_match = _FUNCTION_MACROS[0].search(prefix)
+    if function_match:
+        return function_match.group(1)
+    method_match = _FUNCTION_MACROS[1].search(prefix)
+    if method_match:
+        return f"{method_match.group(1)}::{method_match.group(2)}"
+
+    candidates = []
+    for match in _FUNCTION_LIKE_RE.finditer(prefix):
+        identity = match.group(1)
+        leaf = identity.rsplit("::", 1)[-1].lstrip("~")
+        if leaf not in _FUNCTION_KEYWORDS:
+            candidates.append(identity)
+    if not candidates:
+        return None
+    # Leading annotation macros such as API_EXPORT(...) are conventionally all
+    # caps. Prefer the first declaration-like candidate when one follows them.
+    non_macro = [identity for identity in candidates
+                 if not (identity.isupper() and len(candidates) > 1)]
+    return (non_macro or candidates)[0]
+
 def pair_rows(rows: list[dict], source: str,
               stats: dict | None = None) -> list[tuple[dict, dict]]:
     """Adjacent rows form (vulnerable, benign) pairs -- verified, not assumed.
@@ -270,26 +323,24 @@ def pair_rows(rows: list[dict], source: str,
     PrimeVul's paired splits list the two revisions of a function consecutively.
     Nothing in the file marks a pair boundary, so a single misaligned row would
     silently pair every later function with the wrong counterpart and produce a
-    corpus whose labels are shifted by one. Each pair is therefore checked, and
-    a violation aborts with line numbers rather than being repaired by guesswork.
+    corpus whose labels are shifted by one. Each pair is therefore checked.
+    Structural corruption aborts with line numbers; unverifiable function
+    identity is discarded and counted rather than repaired by guesswork.
 
-    What is checked is what actually holds. Measured over all three paired splits
-    of the v0.1 release (870 + 7578 + 960 rows): every adjacent pair carries one
-    target=1 and one target=0, every row names a commit, and no pair has
-    identical members -- so those are hard errors. But the two members carry
-    *different* commit ids in 19 pairs and different file names in 13 more
-    (with either name absent in 1635), because PrimeVul sometimes draws the
-    benign revision from a later commit than the one that introduced the flaw.
-    Those are real pairs, so treating a mismatch as corruption would discard
-    them; they are counted into `stats` and reported instead, which keeps the
-    fact visible without inventing a rule the dataset does not follow.
+    Opposite labels, non-empty fixing-commit provenance and non-identical source
+    are hard requirements. Both declarations must also yield the same function
+    identity; mismatches and declarations that cannot be identified are skipped
+    and counted. Commit/file-name differences remain reported anomalies because
+    PrimeVul can draw a post-fix revision from a later commit or renamed file.
     """
     if len(rows) % 2:
         raise ValueError(
             f"{source} has {len(rows)} records; a paired split must have an even "
             "count, two rows per function")
     pairs = []
-    anomalies = {"commit_id_differs": 0, "file_name_differs": 0, "file_name_absent": 0}
+    anomalies = {"commit_id_differs": 0, "file_name_differs": 0,
+                 "file_name_absent": 0, "function_identity_differs": 0,
+                 "function_identity_unavailable": 0}
     for first, second in zip(rows[::2], rows[1::2]):
         where = f"{source}:{first['line']},{second['line']}"
         if {first["target"], second["target"]} != {0, 1}:
@@ -305,12 +356,22 @@ def pair_rows(rows: list[dict], source: str,
             raise ValueError(
                 f"{where} have identical source, so the fix is not represented "
                 "and the pair cannot discriminate anything")
+        vulnerable_identity = function_identity(vulnerable["func"])
+        benign_identity = function_identity(benign["func"])
+        if not vulnerable_identity or not benign_identity:
+            anomalies["function_identity_unavailable"] += 1
+            continue
+        if vulnerable_identity != benign_identity:
+            anomalies["function_identity_differs"] += 1
+            continue
         if first["commit_id"] != second["commit_id"]:
             anomalies["commit_id_differs"] += 1
         if not (first["file_name"] and second["file_name"]):
             anomalies["file_name_absent"] += 1
         elif first["file_name"] != second["file_name"]:
             anomalies["file_name_differs"] += 1
+        vulnerable = {**vulnerable, "function_identity": vulnerable_identity}
+        benign = {**benign, "function_identity": benign_identity}
         pairs.append((vulnerable, benign))
     if stats is not None:
         stats.update(anomalies)
@@ -360,8 +421,14 @@ def convert(primevul_dir: Path, out: Path, splits: list[str], *,
         sources.append(report)
         all_pairs.extend((split, vulnerable, benign) for vulnerable, benign in pairs)
 
-    stats = {"pairs_read": len(all_pairs), "skipped_duplicate": 0,
-             "skipped_oversized": 0, "written": 0}
+    stats = {
+        "pairs_read": sum(int(source["records"]) // 2 for source in sources),
+        "skipped_function_identity": sum(
+            source["pair_anomalies"]["function_identity_differs"]
+            + source["pair_anomalies"]["function_identity_unavailable"]
+            for source in sources),
+        "skipped_duplicate": 0, "skipped_oversized": 0, "written": 0,
+    }
 
     # Build into a sibling and swap only once the manifest is written.
     #
@@ -462,6 +529,7 @@ def _convert_pairs(out: Path, all_pairs: list, stats: dict, max_pairs: int,
             "commit_id": commit,
             "project": vulnerable["project"],
             "file_name": vulnerable["file_name"],
+            "function_identity": vulnerable["function_identity"],
             "cwe": cwes,
             "cve": vulnerable["cve"] or benign["cve"],
             # load_pairs surfaces `queries` in its results; the CWE list is the
@@ -480,7 +548,9 @@ def _convert_pairs(out: Path, all_pairs: list, stats: dict, max_pairs: int,
     if max_pairs and stats["written"] < max_pairs:
         raise SystemExit(
             f"requested {max_pairs} pairs but only {stats['written']} were usable "
-            f"({stats['skipped_duplicate']} duplicate, "
+            f"({stats['skipped_function_identity']} function-identity "
+            "mismatch/unavailable, "
+            f"{stats['skipped_duplicate']} duplicate, "
             f"{stats['skipped_oversized']} oversized)")
 
     manifest = out / MANIFEST_NAME
@@ -558,6 +628,12 @@ def verify(root: Path) -> dict:
             raise SystemExit(
                 f"row {index} declares ground_truth {row.get('ground_truth')!r}, "
                 f"expected {GROUND_TRUTH!r}")
+        identity = row.get("function_identity")
+        if not isinstance(identity, str) or not identity:
+            raise SystemExit(
+                f"row {index} has no verified function_identity; re-convert with "
+                f"{CONVERTER_VERSION}")
+        member_identities = []
         for key, hash_key in (("original_file", "original_sha256"),
                               ("secure_file", "secure_sha256")):
             relative = row[key]
@@ -578,8 +654,14 @@ def verify(root: Path) -> dict:
                 raise SystemExit(
                     f"row {index} {hash_key} mismatch for {relative}: manifest says "
                     f"{row[hash_key][:12]}, file is {digest[:12]}")
+            member_identities.append(function_identity(
+                path.read_text(encoding="utf-8", errors="ignore")))
         if row["original_sha256"] == row["secure_sha256"]:
             raise SystemExit(f"row {index} has identical members")
+        if member_identities != [identity, identity]:
+            raise SystemExit(
+                f"row {index} function identity mismatch: manifest says {identity!r}, "
+                f"members are {member_identities!r}")
     return {"rows": len(rows), "files": len(seen_paths),
             "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
 
@@ -614,7 +696,8 @@ def _cmd_describe(a) -> None:
                 noted = ", ".join(f"{key}={value}" for key, value in
                                   sorted(anomalies.items()) if value)
                 if noted:
-                    line += f" ({noted}; tolerated, see pair_rows)"
+                    line += (f" ({noted}; function-identity anomalies rejected, "
+                             "others tolerated; see pair_rows)")
             except ValueError as exc:
                 line += f", NOT PAIRABLE: {exc}"
         else:
@@ -636,6 +719,8 @@ def _cmd_convert(a) -> None:
     stats, sizes = provenance["stats"], provenance["member_characters"]
     print(f"[primevul] wrote {stats['written']} pairs to {a.out}")
     print(f"[primevul]   read {stats['pairs_read']}, skipped "
+          f"{stats['skipped_function_identity']} function-identity "
+          "mismatch/unavailable / "
           f"{stats['skipped_duplicate']} duplicate / "
           f"{stats['skipped_oversized']} oversized")
     print(f"[primevul]   languages {provenance['languages']}, "
@@ -644,7 +729,8 @@ def _cmd_convert(a) -> None:
         noted = ", ".join(f"{key}={value}" for key, value
                           in sorted(report["pair_anomalies"].items()) if value)
         if noted:
-            print(f"[primevul]   {report['file']}: {noted} (tolerated)")
+            print(f"[primevul]   {report['file']}: {noted} "
+                  "(function-identity anomalies rejected; others tolerated)")
     print(f"[primevul]   member size chars: median {sizes['median']}, "
           f"p90 {sizes['p90']}, p99 {sizes['p99']}, max {sizes['max']}")
     print(f"[primevul]   ~{sizes['p90'] // 4} tokens at p90 (rough 4 chars/token); "
