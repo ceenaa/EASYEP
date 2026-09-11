@@ -160,12 +160,55 @@ fail immediately.
 
 ### Interactive debugging block
 
+This is a held batch allocation, not `salloc`. `v4/dev_hold.sbatch` requests one
+node, one task, four H100s (`--gpus-per-node=h100:4`), 32 CPUs, 450G of memory
+and a three-hour walltime - the same four-GPU shape as production, so debugging
+exercises the real device layout. Change the values in that file; `sbatch` reads
+them from its `#SBATCH` lines. The batch allocation outlives an SSH disconnect,
+which is why this route is preferred over `salloc`.
+
 ```bash
 cd "$EASYEP_REPO"
 sbatch --account=rrg-tayebi_gpu v4/dev_hold.sbatch
 squeue -u "$USER"
 srun --jobid=JOB_ID --overlap --pty bash -l
 ```
+
+`squeue` must show the job as `R` before attaching; while it is `PD` the job is
+still queued and `srun` will fail. Attach from a Rorqual login node. `--overlap`
+is required because the batch script already occupies the allocation's only task
+slot.
+
+`salloc` is the direct alternative for a single short session: it blocks until
+the resources are granted and leaves you in the compute shell, with no attach
+step. Give it the same resources:
+
+```bash
+salloc --account=rrg-tayebi_gpu --nodes=1 --ntasks=1 \
+    --gpus-per-node=h100:4 --cpus-per-task=32 --mem=450G --time=03:00:00
+```
+
+The trade-off is that an `salloc` session is tied to its terminal: an SSH
+disconnect ends the allocation and kills running work. The held batch allocation
+does not, so use it for multi-step debugging and `salloc` only when a single
+session suffices. If you do need `salloc` over an unreliable link, start it
+inside `tmux` or `screen`; the Alliance page *Prolonging terminal sessions* at
+<https://docs.alliancecan.ca/wiki/Prolonging_terminal_sessions> documents both.
+
+Before requesting the four-GPU allocation, a one-task `salloc` verifies access and
+the interactive path in seconds:
+
+```bash
+salloc --account=rrg-tayebi_gpu --ntasks=1 --mem-per-cpu=3G --time=00:10:00
+# now on the compute node; exit releases the allocation
+srun hostname
+exit
+```
+
+Run `salloc` bare, as above: with a command argument (`salloc ... bash -c ...`)
+that command executes on the login node, not the compute node. A request this
+small lands on a CPU test node almost immediately even when the four-GPU request
+sits at `(Priority)` waiting for a free GPU node.
 
 Inside the compute-node shell, export the paths and explicit experiment values:
 
