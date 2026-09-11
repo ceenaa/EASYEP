@@ -1,6 +1,11 @@
 .idea/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.venv*/
+venv/
 
 # Local experiment corpus; its external location and content digest are recorded
 # by the V4 launcher, but the corpus itself must not be committed to this repo.
@@ -10,3 +15,25 @@ deepseek_easy_ep_inputs/
 # above -- the run manifest records the digest, the data stays out of the repo.
 primevul_*.jsonl
 primevul-c-files/
+
+# External evaluation inputs and downloaded model artifacts
+/dist/
+/runs/
+/results/
+/tmp/
+/slurm-*.log
+/data/
+/metadata_full.csv
+/primevul_aligned_100_samples*.zip
+/models/
+/checkpoints/
+*.safetensors
+*.gguf
+*.ftw
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key

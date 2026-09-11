@@ -1,0 +1,14 @@
+{
+  "model_repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "model_revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+  "model_directory": "DeepSeek-V4-Flash-0731",
+  "uv_version": "0.12.10",
+  "python_version": "3.12",
+  "cuda_package": "cuda-toolkit-13-0=13.0.3-1",
+  "min_ram_bytes": 240000000000,
+  "fresh_disk_bytes": 240000000000,
+  "min_available_ram_bytes": 190000000000,
+  "max_seq_len": 16384,
+  "max_output_tokens": 14336,
+  "reasoning_effort": "low"
+}

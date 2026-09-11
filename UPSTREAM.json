@@ -1,0 +1,10 @@
+{
+  "FreeToken": {
+    "url": "https://github.com/FlashML-org/FreeToken.git",
+    "commit": "46d27439a4fccf457e1a9a858841168ec7a1c65d"
+  },
+  "EASYEP": {
+    "url": "https://github.com/RUCAIBox/EASYEP.git",
+    "commit": "04946c9562ddee772b3c3e1fb2c7552c9b604a25"
+  }
+}
